@@ -24,6 +24,7 @@
 
 #include "mgt-headers.h"
 #include "wifi-mac.h"
+#include <cstdint>
 
 #include <set>
 #include <variant>
