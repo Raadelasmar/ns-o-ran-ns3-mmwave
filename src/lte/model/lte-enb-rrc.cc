@@ -4050,6 +4050,11 @@ LteEnbRrc::DoRecvUeSinrUpdate(EpcX2SapUser::UeImsiSinrParams params)
     {
         m_allowHandoverTo.insert(std::pair<uint16_t, bool>(mmWaveCellId, true));
     }
+    if (m_cellIndividualOffset.find(mmWaveCellId) == m_cellIndividualOffset.end())
+    {
+        // CIO defaults to 1.0 (linear) = 0 dB: ranking is unbiased until set
+        m_cellIndividualOffset.insert(std::pair<uint16_t, double>(mmWaveCellId, 1.0));
+    }
 
     // cycle on all the Imsi whose SINR is known in cell mmWaveCellId
     for (std::map<uint64_t, double>::iterator imsiIter = params.ueImsiSinrMap.begin();
@@ -4694,6 +4699,7 @@ LteEnbRrc::TriggerUeAssociationUpdate()
             }
 
             long double maxSinr = 0;
+            long double maxBiasedSinr = 0;
             long double currentSinr = 0;
             uint16_t maxSinrCellId = 0;
             bool alreadyAssociatedImsi = false;
@@ -4725,11 +4731,18 @@ LteEnbRrc::TriggerUeAssociationUpdate()
                 // check if the BS is barred from HOs and in case ignore it
                 if (m_allowHandoverTo.find(cellIter->first)->second)
                 {
+                    // CIO biases the ranking only; default 1.0 (0 dB) if unset
+                    auto cioIter = m_cellIndividualOffset.find(cellIter->first);
+                    long double cio = (cioIter != m_cellIndividualOffset.end())
+                                          ? cioIter->second
+                                          : 1.0;
+                    long double biasedSinr = cellIter->second * cio;
                     NS_LOG_INFO("Cell " << cellIter->first << " reports "
-                                        << 10 * std::log10(cellIter->second));
-                    if (cellIter->second > maxSinr)
+                                        << 10 * std::log10(cellIter->second) << " (biased "
+                                        << 10 * std::log10(biasedSinr) << ")");
+                    if (biasedSinr > maxBiasedSinr)
                     {
-                        maxSinr = cellIter->second;
+                        maxBiasedSinr = biasedSinr;
                         maxSinrCellId = cellIter->first;
                     }
                 }
@@ -4744,6 +4757,15 @@ LteEnbRrc::TriggerUeAssociationUpdate()
                 {
                     currentSinr = cellIter->second;
                 }
+            }
+            // The argmax above ranked CIO-biased values. Everything from here on
+            // (maxSinrDb, sinrDifference, ComputeTtt, and in particular the
+            // outage check against m_outageThreshold below) must see the RAW
+            // SINR of the chosen cell, so re-read it from the unbiased map. A
+            // positive CIO must never mask a real outage.
+            if (maxSinrCellId != 0)
+            {
+                maxSinr = imsiIter->second.find(maxSinrCellId)->second;
             }
             long double sinrDifference = std::abs(
                 10 * (std::log10((long double)maxSinr) - std::log10((long double)currentSinr)));
@@ -4935,6 +4957,7 @@ LteEnbRrc::UpdateUeHandoverAssociation()
         {
             uint64_t imsi = imsiIter->first;
             long double maxSinr = 0;
+            long double maxBiasedSinr = 0;
             long double currentSinr = 0;
             uint16_t maxSinrCellId = 0;
             bool alreadyAssociatedImsi = false;
@@ -4961,17 +4984,32 @@ LteEnbRrc::UpdateUeHandoverAssociation()
                  cellIter != imsiIter->second.end();
                  ++cellIter)
             {
+                // CIO biases the ranking only; default 1.0 (0 dB) if unset
+                auto cioIter = m_cellIndividualOffset.find(cellIter->first);
+                long double cio =
+                    (cioIter != m_cellIndividualOffset.end()) ? cioIter->second : 1.0;
+                long double biasedSinr = cellIter->second * cio;
                 NS_LOG_INFO("Cell " << cellIter->first << " reports "
-                                    << 10 * std::log10(cellIter->second));
-                if (cellIter->second > maxSinr)
+                                    << 10 * std::log10(cellIter->second) << " (biased "
+                                    << 10 * std::log10(biasedSinr) << ")");
+                if (biasedSinr > maxBiasedSinr)
                 {
-                    maxSinr = cellIter->second;
+                    maxBiasedSinr = biasedSinr;
                     maxSinrCellId = cellIter->first;
                 }
                 if (m_lastMmWaveCell[imsi] == cellIter->first)
                 {
                     currentSinr = cellIter->second;
                 }
+            }
+            // The argmax above ranked CIO-biased values. Everything downstream
+            // (maxSinrDb, sinrDifference, and the outage check against
+            // m_outageThreshold below) must see the RAW SINR of the chosen
+            // cell, so re-read it from the unbiased map. A positive CIO must
+            // never mask a real outage.
+            if (maxSinrCellId != 0)
+            {
+                maxSinr = imsiIter->second.find(maxSinrCellId)->second;
             }
 
             long double sinrDifference = std::abs(
@@ -6128,6 +6166,31 @@ LteEnbRrc::GetAllowHandoverTo()
     return m_allowHandoverTo;
 }
 
+bool
+LteEnbRrc::SetCellIndividualOffset(uint16_t cellId, double cioDb)
+{
+    if (cioDb < -6.0 || cioDb > 6.0)
+    {
+        double clamped = std::min(std::max(cioDb, -6.0), 6.0);
+        NS_LOG_WARN("CIO for cell " << cellId << " requested " << cioDb
+                                    << " dB is outside [-6, +6], clamped to " << clamped << " dB");
+        cioDb = clamped;
+    }
+    auto entry = m_cellIndividualOffset.find(cellId);
+    if (entry != m_cellIndividualOffset.end())
+    {
+        entry->second = std::pow(10.0, cioDb / 10.0);
+        NS_LOG_INFO("CIO for cell " << cellId << " set to " << cioDb
+                                    << " dB (linear multiplier " << entry->second << ")");
+        return true;
+    }
+    else
+    {
+        NS_LOG_WARN("CIO requested for unknown cell " << cellId << ", ignored");
+        return false;
+    }
+}
+
 void
 LteEnbRrc::EvictUsersFromSecondaryCell()
 {
@@ -6160,7 +6223,7 @@ LteEnbRrc::EvictUsersFromSecondaryCell()
             //   continue;
             // }
 
-            long double maxSinr = 0;
+            long double maxBiasedSinr = 0;
             uint16_t maxSinrCellId = 0;
             bool alreadyAssociatedImsi = false;
             bool onHandoverImsi = true;
@@ -6203,11 +6266,20 @@ LteEnbRrc::EvictUsersFromSecondaryCell()
                 // check if the BS is barred from HOs and in case ignore it
                 if (m_allowHandoverTo.find(cellIter->first)->second)
                 {
+                    // CIO biases the ranking only; default 1.0 (0 dB) if unset.
+                    // No raw re-read is needed after this loop: eviction uses
+                    // only maxSinrCellId downstream, never a dB/threshold value.
+                    auto cioIter = m_cellIndividualOffset.find(cellIter->first);
+                    long double cio = (cioIter != m_cellIndividualOffset.end())
+                                          ? cioIter->second
+                                          : 1.0;
+                    long double biasedSinr = cellIter->second * cio;
                     NS_LOG_INFO("Cell " << cellIter->first << " reports "
-                                        << 10 * std::log10(cellIter->second));
-                    if (cellIter->second > maxSinr)
+                                        << 10 * std::log10(cellIter->second) << " (biased "
+                                        << 10 * std::log10(biasedSinr) << ")");
+                    if (biasedSinr > maxBiasedSinr)
                     {
-                        maxSinr = cellIter->second;
+                        maxBiasedSinr = biasedSinr;
                         maxSinrCellId = cellIter->first;
                     }
                 }

@@ -288,6 +288,53 @@ LteEnbNetDevice::ReadControlFile()
                     }
                 }
             }
+            else if (m_controlFilename.find("cio_actions_for_ns3.csv") != std::string::npos)
+            {
+                // Per-cell Cell Individual Offset for handover ranking.
+                // Rows: timestamp,cellId,cioDb
+                // Note: like the ES branch above, the whole file is re-read each
+                // cycle and every row re-applied; SetCellIndividualOffset is
+                // idempotent, so this is safe.
+                long long timestamp{};
+                while (std::getline(csv, line))
+                {
+                    if (line == "")
+                    {
+                        // skip empty lines
+                        continue;
+                    }
+                    NS_LOG_INFO("Read CIO command");
+                    std::stringstream lineStream(line);
+                    std::string cell;
+
+                    std::getline(lineStream, cell, ',');
+                    timestamp = std::stoll(cell);
+
+                    uint16_t cellId;
+                    std::getline(lineStream, cell, ',');
+                    cellId = std::stoi(cell);
+
+                    double cioDb;
+                    std::getline(lineStream, cell, ',');
+                    cioDb = std::stod(cell);
+
+                    NS_LOG_INFO("Set CIO command with timestamp " << timestamp << " cellId "
+                                                                  << cellId << " cioDb " << cioDb);
+
+                    if (!m_scheduleControlMessages)
+                    {
+                        m_rrc->SetCellIndividualOffset(cellId, cioDb);
+                    }
+                    else
+                    { // Here we pre-schedule all the functions to be executed during the simulation
+                        Simulator::Schedule(MilliSeconds(timestamp),
+                                            &LteEnbRrc::SetCellIndividualOffset,
+                                            m_rrc,
+                                            cellId,
+                                            cioDb);
+                    }
+                }
+            }
             else if (m_controlFilename.find("qos_actions.csv") != std::string::npos)
             { // TODO adapt to the scheduling of the messages
                 long long timestamp{};

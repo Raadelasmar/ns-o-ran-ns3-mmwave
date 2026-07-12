@@ -1642,10 +1642,20 @@ class LteEnbRrc : public Object
      */
     bool SetSecondaryCellHandoverAllowedStatus(uint16_t cellId, bool hoAllowed);
     /**
-     * Get the map m_allowHandoverTo 
+     * Get the map m_allowHandoverTo
      * @returns a map containing cellId, and a bool (true if cell is ON, otherwise false)
     */
     std::map<uint16_t, bool> GetAllowHandoverTo();
+
+    /**
+     * Set the Cell Individual Offset (CIO) of a mmWave/NR BS, used ONLY to bias
+     * the handover ranking (argmax over candidate cells). Safety checks (outage
+     * detection) and E2/KPM reports keep seeing raw, unbiased SINR.
+     * @params cellId
+     * @params cioDb the offset in dB, clamped to [-6, +6]; stored as a linear multiplier
+     * @returns false if the cell is not in the list of known cells
+     */
+    bool SetCellIndividualOffset(uint16_t cellId, double cioDb);
 
     /**
      * Evict users from secondary cells that have deactivated forcing handover to another cell
@@ -2011,6 +2021,12 @@ class LteEnbRrc : public Object
 
     // sleep mode for mmWave/NR BSs controlled by the LTE eNB
     std::map<uint16_t, bool> m_allowHandoverTo; // cellId, true if HO is allowed, false if not
+
+    // Cell Individual Offset for handover ranking: cellId -> LINEAR multiplier
+    // (1.0 = 0 dB). Applied only inside the argmax over candidate cells; never
+    // applied to the values stored in m_imsiCellSinrMap, to outage checks, or
+    // to E2/KPM reporting.
+    std::map<uint16_t, double> m_cellIndividualOffset;
 
     HandoverMode m_handoverMode;
 
