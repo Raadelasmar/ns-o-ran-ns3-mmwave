@@ -100,3 +100,5 @@ stderr
 *.out
 *.xml
 output.txt
+build_log*.txt
+*.bak
