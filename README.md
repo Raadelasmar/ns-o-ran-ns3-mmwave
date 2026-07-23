@@ -1,3 +1,24 @@
+## About this fork
+
+Part of the BME / Nokia Bell Labs project **"Hybrid SON and Multi-Agent AI for Autonomous
+Optimization of Future Mobile Networks."**
+
+Adds a **per-cell Cell Individual Offset (CIO) control lever** to the handover logic
+(`src/lte/model/lte-enb-rrc.{h,cc}`, `lte-enb-net-device.cc`). The offset biases the handover
+ranking only — raw SINR is re-read before every outage / radio-link-failure check, so the lever
+cannot mask a failing connection.
+
+See **[CONTRIBUTIONS.md](CONTRIBUTIONS.md)** for the full record of what was modified.
+
+**Companion repository (required):**
+[Raadelasmar/ns-o-ran-gym](https://github.com/Raadelasmar/ns-o-ran-gym) — the Python environment
+and analysis tooling that drives this simulator.
+
+---
+
+*Original upstream README follows.*
+
+---
 # ns3-mmwave fork for ns-O-RAN
 
 ================================
