@@ -34,6 +34,7 @@
 #include "ns3/nstime.h"
 #include "ns3/traced-callback.h"
 #include <ns3/oran-interface.h>
+#include <nlohmann/json.hpp>
 
 #include <map>
 #include <vector>
@@ -69,6 +70,12 @@ class LteEnbNetDevice : public LteNetDevice
      * \return the object TypeId
      */
     static TypeId GetTypeId(void);
+
+    /**
+     * \brief Apply control actions (CIO, Tx Power, etc.) received from the MARL ZeroMQ bridge
+     * \param actionPayload JSON payload containing cell parameter modifications
+     */
+    void ApplyControlPayload (const nlohmann::json& actionPayload);
 
     LteEnbNetDevice();
 

@@ -102,3 +102,15 @@ stderr
 output.txt
 build_log*.txt
 *.bak
+bsState.txt
+DlMacStats.txt
+DlPdcpStats.txt
+DlRlcStats.txt
+DlRxPhyStats.txt
+DlTxPhyStats.txt
+UlMacStats.txt
+UlPdcpStats.txt
+UlRlcStats.txt
+UlRlcStats.txt
+UlRxPhyStats.txt
+UlTxPhyStats.txt

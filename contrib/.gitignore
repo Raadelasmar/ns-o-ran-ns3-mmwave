@@ -3,3 +3,6 @@
 
 # Include specific files that should be tracked by Git
 !.gitignore
+!oran-interface/
+!oran-interface/model/
+!oran-interface/model/zmq-database-client.h

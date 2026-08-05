@@ -34,6 +34,7 @@
  */
 
 #include "encode_e2apv1.hpp"
+#include <nlohmann/json.hpp>
 
 #include <ns3/abort.h>
 #include <ns3/callback.h>
@@ -422,6 +423,26 @@ LteEnbNetDevice::ReadControlFile()
         }
     }
 }
+
+
+void 
+LteEnbNetDevice::ApplyControlPayload(const nlohmann::json& actionPayload)
+{
+    // 1. Process MLB Agent actions (Cell Individual Offsets / CIO)
+    if (actionPayload.contains("cio_offsets")) {
+        for (auto& [cellIdStr, cioVal] : actionPayload["cio_offsets"].items()) {
+            uint16_t cellId = std::stoi(cellIdStr);
+            double cioDb = cioVal.get<double>();
+            
+            // Re-use the implementation
+            m_rrc->SetCellIndividualOffset(cellId, cioDb);
+        }
+    }
+
+    // 2. Future hooks for COC and MRO agents can be added here cleanly:
+    // if (actionPayload.contains("tx_power_dbm")) { ... }
+}
+
 
 void
 LteEnbNetDevice::SetUeQoS(uint16_t ueId, double percentage)
