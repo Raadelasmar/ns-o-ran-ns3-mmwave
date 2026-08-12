@@ -73,7 +73,9 @@ class LteEnbNetDevice : public LteNetDevice
 
     /**
      * \brief Apply control actions (CIO, Tx Power, etc.) received from the MARL ZeroMQ bridge
-     * \param actionPayload JSON payload containing cell parameter modifications
+     * \param actionPayload JSON payload of the form
+     *        { "cells": { "<cellId>": { "cio_offset": <dB>, ... }, ... } },
+     *        mirroring the per-cell "cells" shape used for the KPI payload sent to Python
      */
     void ApplyControlPayload (const nlohmann::json& actionPayload);
 

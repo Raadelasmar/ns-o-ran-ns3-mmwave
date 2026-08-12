@@ -47,35 +47,80 @@ std::ofstream outFile;
 // ---------------------------------------------------------------------------
 // Periodic MARL Control Step (Executes every T_control seconds)
 // ---------------------------------------------------------------------------
-void MarlControlStep(ns3::ZmqDatabaseClient* zmqClient, 
-                     ns3::Ptr<ns3::LteEnbNetDevice> enbDevice, 
-                     double stepInterval) 
+void MarlControlStep(ns3::ZmqDatabaseClient* zmqClient,
+                     ns3::Ptr<ns3::LteEnbNetDevice> enbDevice,
+                     ns3::NetDeviceContainer mmWaveEnbDevs,
+                     double stepInterval)
 {
     double now = ns3::Simulator::Now().GetSeconds();
 
-    // 1. Package cell KPIs into clean JSON
+    // 1. Package cell KPIs into clean JSON, reading the live counters that the
+    // DU/CU-CP report builders (mmwave-enb-net-device.cc) already maintain for
+    // every real NR cell, instead of a single hardcoded cell.
     json kpiPayload;
     kpiPayload["timestamp"] = now;
-    
-    // Initial test metrics (we will hook up the live 3GPP counters next)
-    kpiPayload["cells"]["8"]["prb_utilization"] = 0.6257; 
-    kpiPayload["cells"]["8"]["buffer_bytes"] = 14200000;
-    
+
+    for (uint32_t i = 0; i < mmWaveEnbDevs.GetN(); ++i)
+    {
+        ns3::Ptr<ns3::mmwave::MmWaveEnbNetDevice> mmDev =
+            ns3::DynamicCast<ns3::mmwave::MmWaveEnbNetDevice>(mmWaveEnbDevs.Get(i));
+        if (!mmDev)
+        {
+            continue;
+        }
+
+        uint16_t cellId = mmDev->GetCellId();
+        std::string cellKey = std::to_string(cellId);
+
+        auto ueMap = mmDev->GetRrc()->GetUeMap();
+        auto l3SinrMap = mmDev->Getl3sinrMap();
+
+        json& cellPayload = kpiPayload["cells"][cellKey];
+        // DRB.RRU.PrbUsedDl / dlPrbUsage, as a [0,1] fraction
+        cellPayload["prb_utilization"] = mmDev->GetDlPrbUsage() / 100.0;
+        // DRB.BufferSize.Qos, RLC tx buffer occupancy summed over connected UEs (bytes)
+        cellPayload["buffer_bytes"] = mmDev->GetRlcBufferOccupancyCellSpecific();
+        // QosFlow.PdcpPduVolumeDL_Filter, MAC DL volume summed over connected UEs (bytes)
+        cellPayload["volume_bytes"] = mmDev->GetMacVolumeCellSpecific();
+        cellPayload["num_active_ues"] = static_cast<uint32_t>(ueMap.size());
+
+        json uesPayload = json::object();
+        for (auto& ue : ueMap)
+        {
+            uint64_t imsi = ue.second->GetImsi();
+            auto ueSinrIt = l3SinrMap.find(imsi);
+            if (ueSinrIt == l3SinrMap.end())
+            {
+                continue;
+            }
+            auto sinrIt = ueSinrIt->second.find(cellId);
+            if (sinrIt == ueSinrIt->second.end())
+            {
+                continue;
+            }
+            // L3 serving SINR, converted from linear to dB (mirrors
+            // BuildRicIndicationMessageCuCp's sinrThisCell computation)
+            uesPayload[std::to_string(imsi)]["l3_serving_sinr_db"] = 10 * std::log10(sinrIt->second);
+        }
+        cellPayload["ues"] = uesPayload;
+    }
+
     // 2. Synchronous handshake: send KPIs and block until Python Gym replies
     json actionPayload = zmqClient->StepSync(kpiPayload);
     
-    // 3. Safely apply the received actions back to ns-3
-    if (actionPayload.is_object() && actionPayload.contains("cells")) {
-        if (actionPayload["cells"].is_object() && actionPayload["cells"].contains("8")) {
-            enbDevice->ApplyControlPayload(actionPayload["cells"]["8"]);
-        }
+    // 3. Safely apply the received actions back to ns-3 (CIO offsets for every real cell
+    // present in actionPayload["cells"], applied via the shared LTE anchor RRC)
+    if (actionPayload.is_object())
+    {
+        enbDevice->ApplyControlPayload(actionPayload);
     }
 
     // 4. Schedule the next control step
-    ns3::Simulator::Schedule(ns3::Seconds(stepInterval), 
-                             &MarlControlStep, 
-                             zmqClient, 
-                             enbDevice, 
+    ns3::Simulator::Schedule(ns3::Seconds(stepInterval),
+                             &MarlControlStep,
+                             zmqClient,
+                             enbDevice,
+                             mmWaveEnbDevs,
                              stepInterval);
 }
 
@@ -211,8 +256,8 @@ static ns3::GlobalValue g_enableTraces ("enableTraces", "If true, generate ns-3 
 static ns3::GlobalValue g_e2lteEnabled ("e2lteEnabled", "If true, send LTE E2 reports",
                                         ns3::BooleanValue (true), ns3::MakeBooleanChecker ());
 
-static ns3::GlobalValue g_e2nrEnabled ("e2nrEnabled", "If false, send NR E2 reports",
-                                        ns3::BooleanValue (false), ns3::MakeBooleanChecker ());
+static ns3::GlobalValue g_e2nrEnabled ("e2nrEnabled", "If true, send NR E2 reports",
+                                        ns3::BooleanValue (true), ns3::MakeBooleanChecker ());
 
 static ns3::GlobalValue g_e2du ("e2du", "If true, send DU reports",
                                         ns3::BooleanValue (true), ns3::MakeBooleanChecker ());
@@ -1119,11 +1164,13 @@ main (int argc, char *argv[])
   double controlInterval = 1.0; // Control interval T_control in seconds
 
   // Schedule the first MARL step at t = 0.0 using the primary LTE eNodeB device
+  // (control target) and the full mmWave eNB container (real per-cell KPI source)
   Ptr<LteEnbNetDevice> primaryLteEnb = lteEnbDevs.Get(0)->GetObject<LteEnbNetDevice>();
-  Simulator::Schedule (Seconds (0.0), 
-                       &MarlControlStep, 
-                       zmqClient, 
-                       primaryLteEnb, 
+  Simulator::Schedule (Seconds (0.0),
+                       &MarlControlStep,
+                       zmqClient,
+                       primaryLteEnb,
+                       mmWaveEnbDevs,
                        controlInterval);
   // =========================================================================
 

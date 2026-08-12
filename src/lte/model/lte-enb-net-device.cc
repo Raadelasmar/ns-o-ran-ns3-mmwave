@@ -425,22 +425,31 @@ LteEnbNetDevice::ReadControlFile()
 }
 
 
-void 
+void
 LteEnbNetDevice::ApplyControlPayload(const nlohmann::json& actionPayload)
 {
-    // 1. Process MLB Agent actions (Cell Individual Offsets / CIO)
-    if (actionPayload.contains("cio_offsets")) {
-        for (auto& [cellIdStr, cioVal] : actionPayload["cio_offsets"].items()) {
-            uint16_t cellId = std::stoi(cellIdStr);
-            double cioDb = cioVal.get<double>();
-            
-            // Re-use the implementation
-            m_rrc->SetCellIndividualOffset(cellId, cioDb);
-        }
+    if (!actionPayload.contains("cells") || !actionPayload["cells"].is_object())
+    {
+        return;
     }
 
-    // 2. Future hooks for COC and MRO agents can be added here cleanly:
-    // if (actionPayload.contains("tx_power_dbm")) { ... }
+    // 1. Process MLB Agent actions (Cell Individual Offsets / CIO), one entry per real cell,
+    // mirroring the "cells" shape used for the KPI payload sent to Python.
+    for (auto& [cellIdStr, cellAction] : actionPayload["cells"].items())
+    {
+        if (!cellAction.is_object() || !cellAction.contains("cio_offset"))
+        {
+            continue;
+        }
+        uint16_t cellId = std::stoi(cellIdStr);
+        double cioDb = cellAction["cio_offset"].get<double>();
+
+        // Re-use the implementation
+        m_rrc->SetCellIndividualOffset(cellId, cioDb);
+    }
+
+    // 2. Future hooks for COC and MRO agents can be added here cleanly, e.g.
+    // actionPayload["cells"][cellId]["tx_power_dbm"], ["ho_margin_db"], etc.
 }
 
 

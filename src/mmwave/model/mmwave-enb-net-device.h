@@ -153,6 +153,19 @@ class MmWaveEnbNetDevice : public MmWaveNetDevice
 
     uint32_t GetMacPduCellSpecific();
 
+    /**
+     * @brief RLC tx buffer occupancy (bytes), summed over all UEs connected to this cell,
+     * as of the last DU report build (DRB.BufferSize.Qos)
+     *
+     */
+    uint32_t GetRlcBufferOccupancyCellSpecific();
+
+    /**
+     * @brief DL PRB usage percentage [0,100] for this cell, as of the last DU report build
+     *
+     */
+    long GetDlPrbUsage();
+
     void SetTurnOffTime(double value);
 
     double GetTurnOffTime();
@@ -286,6 +299,18 @@ class MmWaveEnbNetDevice : public MmWaveNetDevice
      *
      */
     uint32_t m_macVolumeCellSpecific = 0;
+    /**
+     * @brief Attribute representing the rlcBufferOccupCellSpecific value for the cell
+     * (DRB.BufferSize.Qos), cached from the last DU report build
+     *
+     */
+    uint32_t m_rlcBufferOccupCellSpecific = 0;
+    /**
+     * @brief Attribute representing the dlPrbUsage value for the cell, cached from the
+     * last DU report build
+     *
+     */
+    long m_dlPrbUsage = 0;
     /**
      * @brief at which time the cell is turned off
      *

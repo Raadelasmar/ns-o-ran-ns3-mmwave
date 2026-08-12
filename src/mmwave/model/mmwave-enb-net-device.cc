@@ -192,6 +192,18 @@ MmWaveEnbNetDevice::GetMacPduCellSpecific()
     return m_macPduCellSpecific;
 }
 
+uint32_t
+MmWaveEnbNetDevice::GetRlcBufferOccupancyCellSpecific()
+{
+    return m_rlcBufferOccupCellSpecific;
+}
+
+long
+MmWaveEnbNetDevice::GetDlPrbUsage()
+{
+    return m_dlPrbUsage;
+}
+
 void
 MmWaveEnbNetDevice::SetTurnOffTime(double value)
 {
@@ -1379,6 +1391,9 @@ MmWaveEnbNetDevice::BuildRicIndicationMessageDu(std::string plmId, uint16_t nrCe
     long dlPrbUsage = std::min((long)(prbUtilizationDl / dlAvailablePrbs * 100),
                                (long)100); // percentage of used PRBs
     long ulPrbUsage = 0;                   // TODO for future implementation
+
+    m_dlPrbUsage = dlPrbUsage;
+    m_rlcBufferOccupCellSpecific = rlcBufferOccupCellSpecific;
 
     if (!indicationMessageHelper->IsOffline())
     {
