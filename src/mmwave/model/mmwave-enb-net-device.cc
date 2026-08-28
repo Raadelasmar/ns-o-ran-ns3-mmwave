@@ -192,6 +192,20 @@ MmWaveEnbNetDevice::GetMacPduCellSpecific()
     return m_macPduCellSpecific;
 }
 
+std::map<uint64_t, double>
+MmWaveEnbNetDevice::DrainMarlDlRxBytes(double& windowSeconds)
+{
+    double now = Simulator::Now().GetSeconds();
+    windowSeconds = now - m_marlLastDrainSeconds;
+    m_marlLastDrainSeconds = now;
+
+    // swap-and-return: the caller gets every banked byte exactly once and the
+    // accumulator restarts empty, so no byte is double counted or dropped.
+    std::map<uint64_t, double> drained;
+    drained.swap(m_marlDlRxBytes);
+    return drained;
+}
+
 uint32_t
 MmWaveEnbNetDevice::GetRlcBufferOccupancyCellSpecific()
 {
@@ -839,6 +853,13 @@ MmWaveEnbNetDevice::BuildRicIndicationMessageCuUp(std::string plmId)
                      << rxBytes << " txDlBytesNr " << txPdcpPduBytesNrRlc << " pdcpLatency "
                      << pdcpLatency << " pdcpThroughput " << pdcpThroughput << " rlcBitrate "
                      << rlcBitrate);
+
+        // Bank this window's delivered bytes before the reset below discards
+        // them. Deliberately re-reads GetDlRxData, which is a pure read, rather
+        // than reusing the local rxBytes, which has already been scaled to kbit
+        // at the top of this loop. Received only; GetDlTxData is not consulted.
+        m_marlDlRxBytes[imsi] +=
+            static_cast<double>(m_e2PdcpStatsCalculator->GetDlRxData(imsi, 3));
 
         m_e2PdcpStatsCalculator->ResetResultsForImsiLcid(imsi, 3);
 

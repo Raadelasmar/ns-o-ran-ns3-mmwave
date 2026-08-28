@@ -166,6 +166,31 @@ class MmWaveEnbNetDevice : public MmWaveNetDevice
      */
     long GetDlPrbUsage();
 
+    /**
+     * @brief Drain the MARL DL PDCP delivered-bytes accumulator for this cell.
+     *
+     * Returns {imsi -> bytes delivered since the previous drain} and clears the
+     * accumulator, so each byte is handed out exactly once. `windowSeconds` is
+     * set to the simulated time the returned batch covers.
+     *
+     * This exists because reading MmWaveBearerStatsCalculator::GetDlRxData()
+     * directly from the control loop is unsafe. That counter is zeroed by
+     * ResetResultsForImsiLcid() inside the CU-UP report builder's loop over this
+     * cell's ueMap, and nowhere else that touches this instance. (The LTE eNB
+     * calls the same reset, but on its own separate calculator: mmwave-helper.cc
+     * hands the mmWave devices m_e2PdcpStats and the LTE device
+     * m_e2PdcpStatsLte.) So a UE that is absent from every mmWave ueMap at
+     * report time, mid-handover for instance, never gets reset, and its counter
+     * silently accumulates across windows. Measured: a UDP UE read 1.58x its
+     * single-window nominal, and 154 kB more than had been sent. This
+     * accumulator is filled once per CU-UP build, before that reset, and emptied
+     * only by this drain, so it owns its own fill-and-reset cycle and cannot
+     * inherit that gap.
+     *
+     * Reads the received counter only. GetDlTxData is deliberately not involved.
+     */
+    std::map<uint64_t, double> DrainMarlDlRxBytes(double& windowSeconds);
+
     void SetTurnOffTime(double value);
 
     double GetTurnOffTime();
@@ -294,6 +319,13 @@ class MmWaveEnbNetDevice : public MmWaveNetDevice
      *
      */
     uint32_t m_macPduCellSpecific = 0;
+    /**
+     * @brief MARL DL PDCP delivered bytes per IMSI, accumulated since the last
+     * DrainMarlDlRxBytes(). Filled in BuildRicIndicationMessageCuUp.
+     */
+    std::map<uint64_t, double> m_marlDlRxBytes;
+    /** @brief Simulated time (s) of the last DrainMarlDlRxBytes() call. */
+    double m_marlLastDrainSeconds = 0.0;
     /**
      * @brief Attribute representing the macVolumeCellSpecific value for the cell
      *

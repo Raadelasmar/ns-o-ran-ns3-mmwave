@@ -45,8 +45,31 @@ NS_LOG_COMPONENT_DEFINE ("ScenarioThree");
 std::ofstream outFile;
 
 // ---------------------------------------------------------------------------
-// Periodic MARL Control Step (Executes every T_control seconds)
+// Periodic MARL control step, scheduled every T_control seconds.
 // ---------------------------------------------------------------------------
+// Handover events for the PingPong reward term. One record per handover start,
+// accumulated by the trace callback below and drained by MarlControlStep exactly
+// once per control period.
+struct MarlHandoverRecord
+{
+    double timeS;
+    uint64_t imsi;
+    uint16_t srcCell;
+    uint16_t dstCell;
+};
+static std::vector<MarlHandoverRecord> g_marlHandovers;
+
+// The signature has to match the UE RRC HandoverStart trace exactly. See
+// MmWaveBearerStatsConnector::NotifyHandoverStartUe.
+void MarlHandoverStartCallback(std::string /*context*/,
+                               uint64_t imsi,
+                               uint16_t cellId,
+                               uint16_t /*rnti*/,
+                               uint16_t targetCellId)
+{
+    g_marlHandovers.push_back({ns3::Simulator::Now().GetSeconds(), imsi, cellId, targetCellId});
+}
+
 void MarlControlStep(ns3::ZmqDatabaseClient* zmqClient,
                      ns3::Ptr<ns3::LteEnbNetDevice> enbDevice,
                      ns3::NetDeviceContainer mmWaveEnbDevs,
@@ -84,10 +107,129 @@ void MarlControlStep(ns3::ZmqDatabaseClient* zmqClient,
         cellPayload["volume_bytes"] = mmDev->GetMacVolumeCellSpecific();
         cellPayload["num_active_ues"] = static_cast<uint32_t>(ueMap.size());
 
+        // DL PDCP delivered bytes, drained from this cell's own accumulator.
+        // This is what the Satisfaction reward term consumes, not the per-UE
+        // dl_pdcp_delivered_bytes below, which is a raw read of a counter whose
+        // reset can be missed during handover. See the DrainMarlDlRxBytes docs.
+        //
+        // Emitted at cell level rather than inside "ues" on purpose: the drained
+        // map can hold an IMSI that delivered bytes earlier in the period and has
+        // since moved to another cell, so it is not a subset of the current
+        // ueMap. Nesting it under "ues" would silently drop exactly those bytes.
+        //
+        // pdcp_window_s is the simulated time this batch covers. It is reported
+        // rather than assumed, so Python never has to guess the window and the
+        // value stays correct if T_control changes.
+        double pdcpWindowS = 0.0;
+        auto drainedPdcp = mmDev->DrainMarlDlRxBytes (pdcpWindowS);
+        json deliveredPayload = json::object();
+        for (auto& kv : drainedPdcp)
+        {
+            deliveredPayload[std::to_string (kv.first)] = kv.second;
+        }
+        cellPayload["pdcp_delivered_bytes"] = deliveredPayload;
+        cellPayload["pdcp_window_s"] = pdcpWindowS;
+
+        // L1M.RS-SINR bin distribution, 7 bins, summed over this cell's UEs.
+        // Feeds the BadSignal reward term, which wants bins[0] / sum(bins) =
+        // fraction of DL transmissions at <= -6 dB.
+        //
+        // Source counters: MmWavePhyTrace::m_macSinrBin1..7UeSpecific, written
+        // by MmWavePhyTrace::UpdateTraces() (mmwave-phy-trace.cc:306-333),
+        // which buckets every DL transmission by 10*log10(sinr) into
+        //   [0] <= -6 dB, [1] <= 0, [2] <= 6, [3] <= 12, [4] <= 18, [5] <= 24, [6] > 24.
+        //
+        // Read through the same MmWavePhyTrace instance that already backs
+        // volume_bytes and prb_utilization, the device's "E2DuCalculator"
+        // attribute (mmwave-enb-net-device.cc:280-284). Two consequences worth
+        // knowing. First, these bins are alive exactly when volume_bytes is,
+        // since UpdateTraces() increments both on the same call. Second, they are
+        // reset by ResetPhyTracesForRntiCellId (mmwave-phy-trace.cc:506-518)
+        // alongside m_macVolumeUeSpecific, so they cover the same 0.1 s E2
+        // indication window as volume_bytes, not the whole control period.
+        ns3::PointerValue duCalcValue;
+        mmDev->GetAttribute ("E2DuCalculator", duCalcValue);
+        ns3::Ptr<ns3::mmwave::MmWavePhyTrace> duCalc =
+            duCalcValue.Get<ns3::mmwave::MmWavePhyTrace> ();
+        std::vector<uint32_t> sinrBins (7, 0);
+        if (duCalc)
+        {
+            for (auto& ue : ueMap)
+            {
+                uint16_t rnti = ue.second->GetRnti ();
+                sinrBins[0] += duCalc->GetMacSinrBin1UeSpecific (rnti, cellId);
+                sinrBins[1] += duCalc->GetMacSinrBin2UeSpecific (rnti, cellId);
+                sinrBins[2] += duCalc->GetMacSinrBin3UeSpecific (rnti, cellId);
+                sinrBins[3] += duCalc->GetMacSinrBin4UeSpecific (rnti, cellId);
+                sinrBins[4] += duCalc->GetMacSinrBin5UeSpecific (rnti, cellId);
+                sinrBins[5] += duCalc->GetMacSinrBin6UeSpecific (rnti, cellId);
+                sinrBins[6] += duCalc->GetMacSinrBin7UeSpecific (rnti, cellId);
+            }
+        }
+        cellPayload["sinr_bins"] = sinrBins;
+
+        // Per-UE DL PDCP bytes actually DELIVERED (received), feeding the
+        // Satisfaction reward term.
+        //
+        // Source: MmWaveBearerStatsCalculator::GetDlRxData(imsi, LCID 3), a
+        // pure read that returns m_dlRxData[p] with no side effect. It is the
+        // same counter the CU-UP report builder turns into
+        // DRB.UEThpDlPdcpBased.UEID / drbuethpdlpdcpbasedueid
+        // (mmwave-enb-net-device.cc:748, becoming pdcpThroughputRx at :824).
+        // Received, not transmitted, so it is not retransmission-inflated.
+        // GetDlTxData and the RLC GetTxBytesInReportingPeriod are both TX and
+        // both wrong for this term.
+        //
+        // We read the calculator rather than m_drbThrDlPdcpBasedComputationUeid
+        // because that member is filled by the CU-UP builder (:829) and then read
+        // and cleared by the DU builder (:1323, :1380) inside the same
+        // BuildAndSendReportMessage call. Reports run at E2Periodicity offset by
+        // 800 us (0.0008, 0.1008, ... scheduled at :615 and :1642) while
+        // MarlControlStep runs on its own T_control grid starting at 0.0, so at
+        // every control step that member has just been cleared and would read
+        // deterministically zero. Reading the calculator sidesteps it entirely.
+        //
+        // We reset nothing here, so the CU-UP report at t+0.0008 still sees its
+        // full window and every existing consumer stays byte-identical: the CU-UP
+        // report, the DU report's drbThrDlPdcpBasedUeid, and the offline CSV/DB.
+        // Our value covers the 99.2 ms since the last report's reset (:864)
+        // rather than a full 100 ms, a deliberate ~0.8% undercount.
+        //
+        // If the calculator pointer does not resolve we emit no key at all, so
+        // Python can tell "measured, and it was zero" (a real, penalisable
+        // failure) from "not measured" (the term must be dropped, not zeroed).
+        ns3::PointerValue pdcpCalcValue;
+        mmDev->GetAttribute ("E2PdcpCalculator", pdcpCalcValue);
+        ns3::Ptr<ns3::mmwave::MmWaveBearerStatsCalculator> pdcpCalc =
+            pdcpCalcValue.Get<ns3::mmwave::MmWaveBearerStatsCalculator> ();
+
         json uesPayload = json::object();
         for (auto& ue : ueMap)
         {
             uint64_t imsi = ue.second->GetImsi();
+            std::string imsiKey = std::to_string(imsi);
+
+            // Written before the SINR lookups below on purpose: those `continue`
+            // past any UE with no L3 SINR report, and a UE can be delivering data
+            // while having no measurement report yet. Emitting PDCP first means
+            // such a UE still reports its bytes instead of vanishing from the
+            // payload and silently undercounting Satisfaction.
+            if (pdcpCalc)
+            {
+                uesPayload[imsiKey]["dl_pdcp_delivered_bytes"] =
+                    static_cast<double>(pdcpCalc->GetDlRxData(imsi, 3));
+                // Sibling counter, emitted so delivered can be validated against
+                // a quantity it cannot legitimately exceed. Same calculator
+                // object, same (imsi, lcid=3) key, and erased by the same
+                // ResetResultsForImsiLcid call that clears m_dlRxData
+                // (mmwave-bearer-stats-calculator.cc), so tx and rx cover the
+                // identical window by construction. rx <= tx is a hard invariant:
+                // you cannot receive more than was sent, so rx/tx > 1 means the
+                // delivered counter is wrong.
+                uesPayload[imsiKey]["dl_pdcp_tx_bytes"] =
+                    static_cast<double>(pdcpCalc->GetDlTxData(imsi, 3));
+            }
+
             auto ueSinrIt = l3SinrMap.find(imsi);
             if (ueSinrIt == l3SinrMap.end())
             {
@@ -100,10 +242,30 @@ void MarlControlStep(ns3::ZmqDatabaseClient* zmqClient,
             }
             // L3 serving SINR, converted from linear to dB (mirrors
             // BuildRicIndicationMessageCuCp's sinrThisCell computation)
-            uesPayload[std::to_string(imsi)]["l3_serving_sinr_db"] = 10 * std::log10(sinrIt->second);
+            uesPayload[imsiKey]["l3_serving_sinr_db"] = 10 * std::log10(sinrIt->second);
         }
         cellPayload["ues"] = uesPayload;
     }
+
+    // 1b. Drain the handovers seen since the previous control step.
+    // Top-level rather than per-cell: a handover belongs to a pair of cells, so
+    // nesting it under one of them would force an arbitrary choice and make the
+    // Python side re-derive the pairing. Emitted even when empty, so Python can
+    // tell "no handovers this step" (a real, meaningful zero) from "this ns-3
+    // build does not send the field at all".
+    json handoverPayload = json::array();
+    for (const auto& h : g_marlHandovers)
+    {
+        json rec;
+        rec["t"] = h.timeS;
+        rec["imsi"] = h.imsi;
+        rec["src"] = h.srcCell;
+        rec["dst"] = h.dstCell;
+        handoverPayload.push_back(rec);
+    }
+    g_marlHandovers.clear();          // we own the fill-and-drain cycle
+    kpiPayload["handovers"] = handoverPayload;
+    kpiPayload["handover_window_s"] = stepInterval;
 
     // 2. Synchronous handshake: send KPIs and block until Python Gym replies
     json actionPayload = zmqClient->StepSync(kpiPayload);
@@ -267,6 +429,47 @@ static ns3::GlobalValue g_e2cuUp ("e2cuUp", "If true, send CU-UP reports",
 
 static ns3::GlobalValue g_e2cuCp ("e2cuCp", "If true, send CU-CP reports",
                                         ns3::BooleanValue (true), ns3::MakeBooleanChecker ());
+
+// ZeroMQ port the MARL bridge connects to. This used to be hardcoded to 5555,
+// which made parallel training impossible: two ns-3 instances would fight over
+// one socket, so every A/B pair and every load sweep had to run sequentially, at
+// about 95 min per arm. The Python side already took a port (MlbZmqEnv passes
+// zmq_port down to ZmqStateDatabase); only this literal was missing. The 5555
+// default reproduces the previous behaviour.
+static ns3::GlobalValue g_zmqPort (
+    "zmqPort", "TCP port of the MARL ZeroMQ bridge (tcp://localhost:PORT)",
+    ns3::UintegerValue (5555), ns3::MakeUintegerChecker<uint16_t> ());
+
+// Control period T_control in seconds, i.e. how often the agent observes and
+// acts. This used to be a hardcoded local. Wall-clock cost scales with simulated
+// seconds rather than with the number of RL steps, so halving this doubles the RL
+// steps per unit of compute. The tradeoff is that it also shortens the time each
+// CIO has to take effect (DynamicTtt TTT is 25-150 ms), so it changes the control
+// problem slightly. Keep Python's control_period_s consistent when changing it.
+// The 1.0 default reproduces the previous behaviour.
+static ns3::GlobalValue g_controlInterval (
+    "controlInterval", "MARL control period T_control in seconds",
+    ns3::DoubleValue (1.0), ns3::MakeDoubleChecker<double> (0.01));
+
+// DL offered-load knob for the trafficModel=3 full-buffer UDP UEs (u % 4 == 0).
+//
+// `ues` used to be the only way to change downlink load, but it conflates two
+// things: how many UEs the topology has, which MLB wants high so the CIO lever
+// has users to move, and how much DL traffic is offered, which has to sit near
+// capacity rather than far above it. Measured at ues=5, 9 full-buffer UEs at
+// 500 us offer 188.6 Mbps against about 168 Mbps carried, so the RLC queues ramp
+// without bound, hit the 10 MB per-bearer cap and start dropping. No CIO policy
+// can fix that network. At ues=3 the queues are stable but a -3 dB offload moves
+// nothing (backlog -1.2%, p=0.96). This knob decouples the two, so the load can
+// be set near capacity at the UE count that actually has traction.
+//
+// The 500 us default reproduces the previous hardcoded behaviour exactly.
+// bytes/s = 1280 / (interval_us * 1e-6); 500 us is 20.96 Mbps including headers.
+static ns3::GlobalValue g_udpFullBufferIntervalUs (
+    "udpFullBufferIntervalUs",
+    "Inter-packet interval (us) of the full-buffer UDP DL clients in trafficModel=3."
+    " 500 = the historical 20.96 Mbps per UE. Larger = less offered DL load.",
+    ns3::UintegerValue (500), ns3::MakeUintegerChecker<uint32_t> ());
 
 static ns3::GlobalValue g_trafficModel (
     "trafficModel",
@@ -468,6 +671,13 @@ main (int argc, char *argv[])
   bool enableTraces = booleanValue.Get ();
   GlobalValue::GetValueByName ("trafficModel", uintegerValue);
   uint8_t trafficModel = uintegerValue.Get ();
+  GlobalValue::GetValueByName ("udpFullBufferIntervalUs", uintegerValue);
+  uint32_t udpFullBufferIntervalUs = uintegerValue.Get ();
+  GlobalValue::GetValueByName ("zmqPort", uintegerValue);
+  uint16_t zmqPort = uintegerValue.Get ();
+  DoubleValue doubleValueTmp;
+  GlobalValue::GetValueByName ("controlInterval", doubleValueTmp);
+  double controlIntervalCfg = doubleValueTmp.Get ();
   GlobalValue::GetValueByName ("nBsNoUesAlloc", integerValue);
   int8_t nBsNoUesAlloc = integerValue.Get ();
   GlobalValue::GetValueByName ("positionAllocator", uintegerValue);
@@ -1012,8 +1222,11 @@ main (int argc, char *argv[])
                   }
                 else
                   {
-                    // Data rate 20 Mbps 
-                    dlClient.SetAttribute ("Interval", TimeValue (MicroSeconds (500)));
+                    // Data rate 20.96 Mbps at the default 500 us; tunable via
+                    // --udpFullBufferIntervalUs to place offered DL load near
+                    // capacity instead of far above it.
+                    dlClient.SetAttribute (
+                        "Interval", TimeValue (MicroSeconds (udpFullBufferIntervalUs)));
                   }
 
                 clientApp.Add (dlClient.Install (remoteHost));
@@ -1158,10 +1371,23 @@ main (int argc, char *argv[])
   // ZERO-MQ MARL BRIDGE INITIALIZATION & SCHEDULING
   // =========================================================================
   // Allocate client on the heap so it persists during the entire Simulator::Run()
-  ns3::ZmqDatabaseClient* zmqClient = new ns3::ZmqDatabaseClient("tcp://localhost:5555");
+  // Hook the UE RRC handover traces. Both paths are required: the mmWave one is
+  // what CIO actually drives, and the LTE one is kept so an inter-RAT fallback is
+  // not silently missed. Connected here, after every device exists, because
+  // ConnectFailSafe silently matches nothing if the path is not yet populated.
+  // Mirrors mmwave-bearer-stats-connector.cc:369-373.
+  Config::ConnectFailSafe ("/NodeList/*/DeviceList/*/LteUeRrc/HandoverStart",
+                           MakeCallback (&MarlHandoverStartCallback));
+  Config::ConnectFailSafe ("/NodeList/*/DeviceList/*/MmWaveUeRrc/HandoverStart",
+                           MakeCallback (&MarlHandoverStartCallback));
+
+  std::string zmqEndpoint = "tcp://localhost:" + std::to_string (zmqPort);
+  NS_LOG_UNCOND ("MARL bridge endpoint " << zmqEndpoint
+                 << " controlInterval " << controlIntervalCfg << " s");
+  ns3::ZmqDatabaseClient* zmqClient = new ns3::ZmqDatabaseClient(zmqEndpoint);
   zmqClient->Connect();
 
-  double controlInterval = 1.0; // Control interval T_control in seconds
+  double controlInterval = controlIntervalCfg; // Control interval T_control in seconds
 
   // Schedule the first MARL step at t = 0.0 using the primary LTE eNodeB device
   // (control target) and the full mmWave eNB container (real per-cell KPI source)
