@@ -8,11 +8,26 @@ Adds a **per-cell Cell Individual Offset (CIO) control lever** to the handover l
 ranking only — raw SINR is re-read before every outage / radio-link-failure check, so the lever
 cannot mask a failing connection.
 
-See **[CONTRIBUTIONS.md](CONTRIBUTIONS.md)** for the full record of what was modified.
+Also adds the simulator half of the Mobility Load Balancing pipeline: **MLB KPI reporting**,
+a **PDCP byte-counting fix**, and **ZeroMQ build support** — the `scenario-marl-zmq` scenario
+exchanges KPIs and CIO offsets with the Python agent over a ZeroMQ socket every control step,
+which is what the MLB reward function and PPO training pipeline in the companion repository
+consume.
+
+### Setting up
+
+**Start at [SETUP.md in the companion repository](https://github.com/Raadelasmar/ns-o-ran-gym/blob/main/SETUP.md).**
+It is the setup path for this project and covers both repositories pinned to exact commits,
+the `contrib/oran-interface` module, the e2sim dependency and the ns-3 build. The upstream
+installation instructions further down this file do not cover any of that.
+
+See **[CONTRIBUTIONS.md](CONTRIBUTIONS.md)** for the full record of what was modified, and
+**[docs/mlb_training_fixes.md](https://github.com/Raadelasmar/ns-o-ran-gym/blob/main/docs/mlb_training_fixes.md)**
+in the companion repository for the training-pipeline detail.
 
 **Companion repository (required):**
-[Raadelasmar/ns-o-ran-gym](https://github.com/Raadelasmar/ns-o-ran-gym) — the Python environment
-and analysis tooling that drives this simulator.
+[Raadelasmar/ns-o-ran-gym](https://github.com/Raadelasmar/ns-o-ran-gym) — the Python environment,
+MLB reward function, training pipeline and analysis tooling that drive this simulator.
 
 ---
 
@@ -39,7 +54,7 @@ Additional material:
 - xApp repositories working with ns-O-RAN:
   - https://github.com/wineslab/ns-o-ran-scp-ric-app-kpimon 
   - https://github.com/wineslab/ns-o-ran-xapp-rc 
-- Gymnasium Environment wrapper for ns-O-RAN https://github.com/wineslab/ns-o-ran-gym-environment
+- Gymnasium Environment wrapper for ns-O-RAN https://github.com/Raadelasmar/ns-o-ran-gym (this fork's companion; upstream is https://github.com/wineslab/ns-o-ran-gym-environment)
 
 ## How to contribute
 
@@ -80,12 +95,20 @@ Main features:
 ## Installation
 This repository contains a complete ns-3 installation with the addition of the mmwave module. 
 
-Use these commands to download and build `ns3-mmwave`:
+For this fork, use these commands (and see
+[SETUP.md](https://github.com/Raadelasmar/ns-o-ran-gym/blob/main/SETUP.md) for the full
+sequence — `contrib/oran-interface` and e2sim have to be in place first, or the build
+will not get past `src/lte`):
 ```
-git clone https://github.com/nyuwireless-unipd/ns3-mmwave.git
-cd ns3-mmwave
-./ns3 configure --disable-python --enable-examples && ./ns3 build
+git clone https://github.com/Raadelasmar/ns-o-ran-ns3-mmwave.git ns-3-mmwave-oran
+cd ns-3-mmwave-oran
+./ns3 configure -d optimized -- -DNS3_EMU=OFF -DNS3_TAP=OFF && ./ns3 build
 ```
+
+`-DNS3_EMU=OFF -DNS3_TAP=OFF` is required on a fresh clone: configuring against a new
+CMake cache hits a dependency ordering problem in `fd-net-device`
+(`The dependency target "raw-sock-creator" ... does not exist`) that an existing cache
+masks, and neither emu nor tap is used by this project.
 
 ## Usage example
 You can use the following command to run the `mmwave-simple-epc` example. 
