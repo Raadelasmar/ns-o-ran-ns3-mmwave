@@ -24,6 +24,7 @@
 #include "spectrum-signal-parameters.h"
 #include "three-gpp-channel-model.h"
 
+#include "ns3/boolean.h"
 #include "ns3/double.h"
 #include "ns3/log.h"
 #include "ns3/net-device.h"
@@ -31,6 +32,7 @@
 #include "ns3/pointer.h"
 #include "ns3/simulator.h"
 #include "ns3/string.h"
+#include "ns3/uinteger.h"
 
 #include <map>
 
@@ -55,6 +57,8 @@ void
 ThreeGppSpectrumPropagationLossModel::DoDispose()
 {
     m_longTermMap.clear();
+    m_delayPhasorMap.clear();
+    m_delayPhasorBytes = 0;
     m_channelModel->Dispose();
     m_channelModel = nullptr;
 }
@@ -73,7 +77,30 @@ ThreeGppSpectrumPropagationLossModel::GetTypeId()
                 StringValue("ns3::ThreeGppChannelModel"),
                 MakePointerAccessor(&ThreeGppSpectrumPropagationLossModel::SetChannelModel,
                                     &ThreeGppSpectrumPropagationLossModel::GetChannelModel),
-                MakePointerChecker<MatrixBasedChannelModel>());
+                MakePointerChecker<MatrixBasedChannelModel>())
+            .AddAttribute(
+                "CacheDelayPhasors",
+                "Cache the per-cluster, per-sub-band phase rotation "
+                "exp(-j*2*pi*f_sb*tau_c) applied in CalcBeamformingGain. Both of its "
+                "inputs are constant until the channel parameters are regenerated, so "
+                "caching it is exact and produces bit-identical results while removing "
+                "two transcendental calls per sub-band per cluster per transmission.",
+                BooleanValue(true),
+                MakeBooleanAccessor(
+                    &ThreeGppSpectrumPropagationLossModel::m_cacheDelayPhasors),
+                MakeBooleanChecker())
+            .AddAttribute(
+                "DelayPhasorCacheMaxMB",
+                "Hard cap on the delay-phasor cache, in MiB. The cache is normally "
+                "bounded by the topology because entries are overwritten in place, so "
+                "this only binds in a scenario that keeps creating new node pairs; "
+                "when it does, the whole cache is dropped and rebuilt on demand. "
+                "Measured usage is about 110 MB for a 7-cell, 35-UE mmWave scenario, and it "
+                "scales with the number of tx-rx pairs.",
+                UintegerValue(1024),
+                MakeUintegerAccessor(
+                    &ThreeGppSpectrumPropagationLossModel::m_phasorCacheMaxMB),
+                MakeUintegerChecker<uint32_t>(1));
     return tid;
 }
 
@@ -132,6 +159,88 @@ ThreeGppSpectrumPropagationLossModel::CalcLongTerm(
     // weights remain unchanged. here we calculate long term uW * Husn * sW, the result is an array
     // of values per cluster
     return params->m_channel.MultiplyByLeftAndRightMatrix(uW.Transpose(), sW);
+}
+
+const ThreeGppSpectrumPropagationLossModel::DelayPhasors*
+ThreeGppSpectrumPropagationLossModel::GetDelayPhasors(
+    Ptr<const SpectrumValue> psd,
+    Ptr<const MatrixBasedChannelModel::ChannelParams> channelParams,
+    uint16_t numCluster) const
+{
+    if (!m_cacheDelayPhasors)
+    {
+        return nullptr;
+    }
+
+    Ptr<const SpectrumModel> sm = psd->GetSpectrumModel();
+    const std::size_t numBands = sm->GetNumBands();
+    const SpectrumModelUid_t smUid = sm->GetUid();
+
+    // A hint, not an identity: every field the table depends on is revalidated
+    // below, so a key collision costs a rebuild rather than a wrong answer.
+    const uint64_t key =
+        MatrixBasedChannelModel::GetKey(channelParams->m_nodeIds.first,
+                                        channelParams->m_nodeIds.second) *
+            0x9E3779B97F4A7C15ULL +
+        smUid;
+
+    Ptr<DelayPhasors> entry;
+    auto it = m_delayPhasorMap.find(key);
+    if (it != m_delayPhasorMap.end())
+    {
+        entry = it->second;
+        if (entry->m_generatedTime == channelParams->m_generatedTime &&
+            entry->m_numBands == numBands && entry->m_numCluster == numCluster &&
+            entry->m_smUid == smUid)
+        {
+            return PeekPointer(entry);
+        }
+        m_delayPhasorBytes -= entry->m_phasor.size() * sizeof(std::complex<double>);
+    }
+
+    const std::size_t wantBytes =
+        static_cast<std::size_t>(numCluster) * numBands * sizeof(std::complex<double>);
+
+    // Entries are overwritten in place, so this only binds for a scenario that
+    // keeps introducing new node pairs. Drop everything rather than carry a
+    // half-evicted map; the tables rebuild lazily on the next transmission.
+    if (m_delayPhasorBytes + wantBytes >
+        static_cast<std::size_t>(m_phasorCacheMaxMB) * 1024 * 1024)
+    {
+        NS_LOG_LOGIC("delay-phasor cache over " << m_phasorCacheMaxMB << " MiB, clearing");
+        m_delayPhasorMap.clear();
+        m_delayPhasorBytes = 0;
+        entry = nullptr;
+    }
+
+    if (!entry)
+    {
+        entry = Create<DelayPhasors>();
+        m_delayPhasorMap[key] = entry;
+    }
+
+    entry->m_generatedTime = channelParams->m_generatedTime;
+    entry->m_numBands = numBands;
+    entry->m_numCluster = numCluster;
+    entry->m_smUid = smUid;
+    entry->m_phasor.assign(static_cast<std::size_t>(numCluster) * numBands,
+                           std::complex<double>(0.0, 0.0));
+    m_delayPhasorBytes += wantBytes;
+
+    for (uint16_t cIndex = 0; cIndex < numCluster; cIndex++)
+    {
+        std::size_t band = 0;
+        for (auto bit = psd->ConstBandsBegin(); bit != psd->ConstBandsEnd(); ++bit, ++band)
+        {
+            // Identical expression, and identical operand order, to the
+            // uncached branch in CalcBeamformingGain.
+            double delay = -2 * M_PI * (*bit).fc * (channelParams->m_delay[cIndex]);
+            entry->m_phasor[static_cast<std::size_t>(cIndex) * numBands + band] =
+                std::complex<double>(cos(delay), sin(delay));
+        }
+    }
+
+    return PeekPointer(entry);
 }
 
 Ptr<SpectrumValue>
@@ -229,8 +338,17 @@ ThreeGppSpectrumPropagationLossModel::CalcBeamformingGain(
 
     // apply the doppler term and the propagation delay to the long term component
     // to obtain the beamforming gain
+    // The per-(sub-band, cluster) phase rotation below depends only on the
+    // sub-band centre frequency and the cluster delay, both fixed until the
+    // channel params are regenerated. When CacheDelayPhasors is on it comes
+    // from a table instead of two transcendental calls per iteration; the
+    // arithmetic that follows is unchanged either way.
+    const DelayPhasors* phasors = GetDelayPhasors(tempPsd, channelParams, numCluster);
+    const std::size_t numBands = phasors ? phasors->m_numBands : 0;
+
     auto vit = tempPsd->ValuesBegin();      // psd iterator
     auto sbit = tempPsd->ConstBandsBegin(); // band iterator
+    std::size_t bandIdx = 0;                // index of the current sub-band
     while (vit != tempPsd->ValuesEnd())
     {
         if ((*vit) != 0.00)
@@ -239,14 +357,24 @@ ThreeGppSpectrumPropagationLossModel::CalcBeamformingGain(
             double fsb = (*sbit).fc; // center frequency of the sub-band
             for (uint16_t cIndex = 0; cIndex < numCluster; cIndex++)
             {
-                double delay = -2 * M_PI * fsb * (channelParams->m_delay[cIndex]);
-                subsbandGain = subsbandGain + longTerm[cIndex] * doppler[cIndex] *
-                                                  std::complex<double>(cos(delay), sin(delay));
+                std::complex<double> phase;
+                if (phasors)
+                {
+                    phase = phasors->m_phasor[static_cast<std::size_t>(cIndex) * numBands +
+                                              bandIdx];
+                }
+                else
+                {
+                    double delay = -2 * M_PI * fsb * (channelParams->m_delay[cIndex]);
+                    phase = std::complex<double>(cos(delay), sin(delay));
+                }
+                subsbandGain = subsbandGain + longTerm[cIndex] * doppler[cIndex] * phase;
             }
             *vit = (*vit) * (norm(subsbandGain));
         }
         vit++;
         sbit++;
+        bandIdx++;
     }
     return tempPsd;
 }

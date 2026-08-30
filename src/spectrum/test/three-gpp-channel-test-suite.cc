@@ -685,6 +685,229 @@ ThreeGppSpectrumPropagationLossModelTest::DoRun()
 /**
  * \ingroup spectrum-tests
  *
+ * Tests ThreeGppSpectrumPropagationLossModel's delay-phasor cache.
+ *
+ * CalcBeamformingGain applies exp(-j*2*pi*f_sb*tau_c) to every cluster of every
+ * sub-band on every transmission. Both inputs are constant until the channel
+ * params are regenerated, so the CacheDelayPhasors attribute tabulates it. The
+ * cache must be exact, and the DelayPhasorCacheMaxMB safety valve must stay
+ * exact even while it is evicting on every call.
+ *
+ * Three configurations are compared on identical inputs:
+ *   a) caching off -- the reference
+ *   b) caching on, cap never reached -- the normal path
+ *   c) caching on, cap deliberately smaller than a single table -- so every
+ *      lookup for a second tx-rx pair drops the whole map and rebuilds
+ *
+ * All three must produce bit-identical PSDs. The map size is asserted directly
+ * (via friendship) so that (c) cannot pass without the eviction having fired.
+ */
+class ThreeGppDelayPhasorCacheTest : public TestCase
+{
+  public:
+    ThreeGppDelayPhasorCacheTest();
+    ~ThreeGppDelayPhasorCacheTest() override;
+
+  private:
+    void DoRun() override;
+
+    /**
+     * Point one antenna at another node
+     * \param thisMob mobility of the node holding thisAntenna
+     * \param otherMob mobility of the node being pointed at
+     * \param thisAntenna the antenna to steer
+     */
+    static void Steer(Ptr<MobilityModel> thisMob,
+                      Ptr<MobilityModel> otherMob,
+                      Ptr<PhasedArrayModel> thisAntenna);
+
+    /**
+     * Exact, band-count-safe PSD comparison
+     * \param first the first PSD
+     * \param second the second PSD
+     * \return true if every band is bit-identical
+     */
+    static bool PsdIdentical(Ptr<const SpectrumValue> first, Ptr<const SpectrumValue> second);
+};
+
+ThreeGppDelayPhasorCacheTest::ThreeGppDelayPhasorCacheTest()
+    : TestCase("ThreeGppSpectrumPropagationLossModel delay-phasor cache is exact, including "
+               "when the size cap is evicting")
+{
+}
+
+ThreeGppDelayPhasorCacheTest::~ThreeGppDelayPhasorCacheTest()
+{
+}
+
+void
+ThreeGppDelayPhasorCacheTest::Steer(Ptr<MobilityModel> thisMob,
+                                    Ptr<MobilityModel> otherMob,
+                                    Ptr<PhasedArrayModel> thisAntenna)
+{
+    Angles completeAngle(otherMob->GetPosition(), thisMob->GetPosition());
+    thisAntenna->SetBeamformingVector(thisAntenna->GetBeamformingVector(completeAngle));
+}
+
+bool
+ThreeGppDelayPhasorCacheTest::PsdIdentical(Ptr<const SpectrumValue> first,
+                                           Ptr<const SpectrumValue> second)
+{
+    if (first->GetSpectrumModel()->GetNumBands() != second->GetSpectrumModel()->GetNumBands())
+    {
+        return false;
+    }
+    for (std::size_t i = 0; i < first->GetSpectrumModel()->GetNumBands(); i++)
+    {
+        if ((*first)[i] != (*second)[i])
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+void
+ThreeGppDelayPhasorCacheTest::DoRun()
+{
+    Config::SetDefault("ns3::ThreeGppChannelModel::UpdatePeriod", TimeValue(MilliSeconds(100)));
+
+    Ptr<ChannelConditionModel> condModel = CreateObject<AlwaysLosChannelConditionModel>();
+    Ptr<ThreeGppSpectrumPropagationLossModel> lossModel =
+        CreateObject<ThreeGppSpectrumPropagationLossModel>();
+    lossModel->SetChannelModelAttribute("Frequency", DoubleValue(2.4e9));
+    lossModel->SetChannelModelAttribute("Scenario", StringValue("UMa"));
+    lossModel->SetChannelModelAttribute("ChannelConditionModel", PointerValue(condModel));
+
+    // Two INDEPENDENT tx-rx pairs, each with its own antennas, so the
+    // beamforming vectors stay fixed for the whole test and the only thing that
+    // varies between phases is the cache configuration.
+    NodeContainer nodes;
+    nodes.Create(4);
+    std::vector<Ptr<MobilityModel>> mob(4);
+    std::vector<Ptr<PhasedArrayModel>> ant(4);
+    const double xPos[4]{0.0, 15.0, 0.0, -15.0};
+    const double yPos[4]{0.0, 0.0, 40.0, 40.0};
+    for (uint32_t i = 0; i < 4; i++)
+    {
+        Ptr<SimpleNetDevice> dev = CreateObject<SimpleNetDevice>();
+        nodes.Get(i)->AddDevice(dev);
+        dev->SetNode(nodes.Get(i));
+        mob[i] = CreateObject<ConstantPositionMobilityModel>();
+        mob[i]->SetPosition(Vector(xPos[i], yPos[i], 10.0));
+        nodes.Get(i)->AggregateObject(mob[i]);
+        ant[i] = CreateObjectWithAttributes<UniformPlanarArray>(
+            "NumColumns",
+            UintegerValue(2),
+            "NumRows",
+            UintegerValue(2),
+            "AntennaElement",
+            PointerValue(CreateObject<IsotropicAntennaModel>()));
+    }
+    Steer(mob[0], mob[1], ant[0]);
+    Steer(mob[1], mob[0], ant[1]);
+    Steer(mob[2], mob[3], ant[2]);
+    Steer(mob[3], mob[2], ant[3]);
+
+    // A deliberately wide spectrum model: one cached table is
+    // numCluster * numBands * sizeof(complex<double>), which at 16384 bands is
+    // megabytes, so the 1 MiB cap below is smaller than a single table and the
+    // eviction branch is reached on the very first lookup of the second pair.
+    const std::size_t numBands = 16384;
+    Bands bands;
+    for (std::size_t i = 0; i < numBands; i++)
+    {
+        BandInfo bi;
+        bi.fl = 2.4e9 + i * 1.0e4;
+        bi.fc = bi.fl + 5.0e3;
+        bi.fh = bi.fl + 1.0e4;
+        bands.push_back(bi);
+    }
+    Ptr<SpectrumModel> sm = Create<SpectrumModel>(bands);
+    Ptr<SpectrumValue> txPsd = Create<SpectrumValue>(sm);
+    (*txPsd) = 0.1 / numBands; // Watts spread over the band
+    Ptr<SpectrumSignalParameters> txParams = Create<SpectrumSignalParameters>();
+    txParams->psd = txPsd->Copy();
+
+    // (a) reference: caching off
+    lossModel->SetAttribute("CacheDelayPhasors", BooleanValue(false));
+    Ptr<SpectrumValue> refA =
+        lossModel->DoCalcRxPowerSpectralDensity(txParams, mob[0], mob[1], ant[0], ant[1]);
+    Ptr<SpectrumValue> refB =
+        lossModel->DoCalcRxPowerSpectralDensity(txParams, mob[2], mob[3], ant[2], ant[3]);
+    NS_TEST_ASSERT_MSG_EQ(lossModel->m_delayPhasorMap.empty(),
+                          true,
+                          "Nothing should be cached while CacheDelayPhasors is false");
+
+    // (b) caching on, cap never reached. Same channel matrices, same beamforming
+    // vectors, same simulated time -- only the phasor source differs.
+    lossModel->SetAttribute("CacheDelayPhasors", BooleanValue(true));
+    lossModel->SetAttribute("DelayPhasorCacheMaxMB", UintegerValue(1024));
+    for (uint32_t rep = 0; rep < 3; rep++)
+    {
+        Ptr<SpectrumValue> gotA =
+            lossModel->DoCalcRxPowerSpectralDensity(txParams, mob[0], mob[1], ant[0], ant[1]);
+        Ptr<SpectrumValue> gotB =
+            lossModel->DoCalcRxPowerSpectralDensity(txParams, mob[2], mob[3], ant[2], ant[3]);
+        NS_TEST_ASSERT_MSG_EQ(PsdIdentical(refA, gotA),
+                              true,
+                              "Cached rx PSD differs from the uncached one (pair A, rep "
+                                  << rep << ")");
+        NS_TEST_ASSERT_MSG_EQ(PsdIdentical(refB, gotB),
+                              true,
+                              "Cached rx PSD differs from the uncached one (pair B, rep "
+                                  << rep << ")");
+    }
+    NS_TEST_ASSERT_MSG_EQ(lossModel->m_delayPhasorMap.size(),
+                          2,
+                          "Both tx-rx pairs should be resident when the cap is generous");
+
+    // (c) caching on, cap smaller than one table.
+    //
+    // The cap is consulted when an entry is inserted or refreshed, never on a
+    // hit -- a valid entry returns before any size check, which is what keeps
+    // the hot path cheap. So the map has to be cold for the eviction branch to
+    // be reachable at all; leaving (b)'s two valid entries in place made an
+    // earlier version of this test pass without ever evicting.
+    lossModel->m_delayPhasorMap.clear();
+    lossModel->m_delayPhasorBytes = 0;
+    lossModel->SetAttribute("DelayPhasorCacheMaxMB", UintegerValue(1));
+    for (uint32_t rep = 0; rep < 3; rep++)
+    {
+        Ptr<SpectrumValue> gotA =
+            lossModel->DoCalcRxPowerSpectralDensity(txParams, mob[0], mob[1], ant[0], ant[1]);
+        NS_TEST_ASSERT_MSG_EQ(lossModel->m_delayPhasorMap.size(),
+                              1,
+                              "The cap should have evicted the other pair (rep " << rep << ")");
+        Ptr<SpectrumValue> gotB =
+            lossModel->DoCalcRxPowerSpectralDensity(txParams, mob[2], mob[3], ant[2], ant[3]);
+        NS_TEST_ASSERT_MSG_EQ(lossModel->m_delayPhasorMap.size(),
+                              1,
+                              "The cap should have evicted the other pair (rep " << rep << ")");
+        NS_TEST_ASSERT_MSG_EQ(PsdIdentical(refA, gotA),
+                              true,
+                              "Evicting rebuilt a different phasor table (pair A, rep "
+                                  << rep << ")");
+        NS_TEST_ASSERT_MSG_EQ(PsdIdentical(refB, gotB),
+                              true,
+                              "Evicting rebuilt a different phasor table (pair B, rep "
+                                  << rep << ")");
+    }
+
+    // A single table larger than the whole cap is still stored rather than
+    // refused, so the cap is a soft bound of (cap + one table). That is
+    // deliberate -- the alternative is a transmission that cannot be computed --
+    // and it is asserted here so the behaviour is not changed by accident.
+    NS_TEST_ASSERT_MSG_GT(lossModel->m_delayPhasorBytes,
+                          1024 * 1024,
+                          "One oversized table should still be resident after eviction");
+
+    Simulator::Destroy();
+}
+
+/**
+ * \ingroup spectrum-tests
+ *
  * Test suite for the ThreeGppChannelModel class
  */
 class ThreeGppChannelTestSuite : public TestSuite
@@ -702,6 +925,7 @@ ThreeGppChannelTestSuite::ThreeGppChannelTestSuite()
     AddTestCase(new ThreeGppChannelMatrixComputationTest, TestCase::QUICK);
     AddTestCase(new ThreeGppChannelMatrixUpdateTest, TestCase::QUICK);
     AddTestCase(new ThreeGppSpectrumPropagationLossModelTest, TestCase::QUICK);
+    AddTestCase(new ThreeGppDelayPhasorCacheTest, TestCase::QUICK);
 }
 
 /// Static variable for test initialization

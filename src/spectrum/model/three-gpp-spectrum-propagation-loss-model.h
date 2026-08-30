@@ -29,6 +29,10 @@
 #include <map>
 #include <unordered_map>
 
+// Test class, declared here so the model can befriend it (see the friend
+// declaration below). Same pattern as two-ray-spectrum-propagation-loss-model.h.
+class ThreeGppDelayPhasorCacheTest;
+
 namespace ns3
 {
 
@@ -50,6 +54,10 @@ class NetDevice;
  */
 class ThreeGppSpectrumPropagationLossModel : public PhasedArraySpectrumPropagationLossModel
 {
+    // Needs access to m_delayPhasorMap to assert that the cap actually evicted,
+    // so the eviction test cannot pass vacuously.
+    friend class ::ThreeGppDelayPhasorCacheTest;
+
   public:
     /**
      * Constructor
@@ -190,8 +198,70 @@ class ThreeGppSpectrumPropagationLossModel : public PhasedArraySpectrumPropagati
         const Vector& sSpeed,
         const Vector& uSpeed) const;
 
+    /**
+     * Cached per-cluster, per-sub-band phase rotations exp(-j*2*pi*f_sb*tau_c)
+     * for one tx-rx pair.
+     *
+     * CalcBeamformingGain applies this factor to every cluster of every
+     * sub-band on every transmission, and both of its inputs -- the sub-band
+     * centre frequency and the cluster delay -- are fixed until the channel
+     * parameters are regenerated (ThreeGppChannelModel::UpdatePeriod). Caching
+     * it replaces two transcendental calls per (sub-band, cluster) per
+     * transmission with a table lookup and is exact: the stored value is the
+     * same std::complex<double> the uncached path computes.
+     *
+     * The Doppler term is deliberately NOT cached here. It depends on the two
+     * nodes' velocities, which change with mobility BETWEEN regenerations, and
+     * on the s/u direction of the channel params, neither of which
+     * m_generatedTime tracks.
+     */
+    struct DelayPhasors : public SimpleRefCount<DelayPhasors>
+    {
+        Time m_generatedTime{Time::Min()}; //!< generation time of the params this was built from
+        std::size_t m_numBands{0};         //!< number of sub-bands the table was built for
+        uint16_t m_numCluster{0};          //!< number of clusters the table was built for
+        SpectrumModelUid_t m_smUid{0};     //!< uid of the spectrum model the table was built for
+        std::vector<std::complex<double>> m_phasor; //!< [cluster * m_numBands + band]
+    };
+
+    /**
+     * Returns the delay-phasor table for the given tx-rx pair, rebuilding it if
+     * the channel parameters have been regenerated, the geometry has changed or
+     * the caller is using a different spectrum model.
+     *
+     * The map key is a hint derived from the node pair and the spectrum model
+     * uid; correctness does not depend on it being collision-free, because
+     * every field the table depends on is stored in the entry and revalidated
+     * on each lookup. A collision therefore costs a rebuild, never a wrong
+     * answer.
+     *
+     * \param psd a PSD carrying the sub-band structure the table must match
+     * \param channelParams the channel params holding the cluster delays
+     * \param numCluster the number of clusters
+     * \return the cached table, or nullptr if caching is disabled
+     */
+    const DelayPhasors* GetDelayPhasors(
+        Ptr<const SpectrumValue> psd,
+        Ptr<const MatrixBasedChannelModel::ChannelParams> channelParams,
+        uint16_t numCluster) const;
+
     mutable std::unordered_map<uint64_t, Ptr<const LongTerm>>
         m_longTermMap;                           //!< map containing the long term components
+    /**
+     * Delay-phasor tables, one per (tx-rx pair, spectrum model). Entries are
+     * overwritten in place rather than appended, so the footprint is a function
+     * of the topology and not of how long the simulation runs. It is cleared on
+     * DoDispose, and wholesale whenever inserting or refreshing an entry would
+     * take it over m_phasorCacheMaxMB, so a scenario that creates and destroys
+     * nodes cannot grow it without bound. The cap is checked only on that
+     * insert/refresh path, never on a cache hit, which keeps the hot path to a
+     * lookup; and a single table larger than the cap is still stored, so the
+     * bound is (cap + one table) rather than a hard ceiling.
+     */
+    mutable std::unordered_map<uint64_t, Ptr<DelayPhasors>> m_delayPhasorMap;
+    mutable std::size_t m_delayPhasorBytes{0};   //!< current size of m_delayPhasorMap in bytes
+    bool m_cacheDelayPhasors{true};              //!< whether to cache the delay phasors
+    uint32_t m_phasorCacheMaxMB{1024};           //!< hard cap on m_delayPhasorMap, in MiB
     Ptr<MatrixBasedChannelModel> m_channelModel; //!< the model to generate the channel matrix
 };
 } // namespace ns3
