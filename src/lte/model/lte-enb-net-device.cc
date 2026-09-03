@@ -433,23 +433,41 @@ LteEnbNetDevice::ApplyControlPayload(const nlohmann::json& actionPayload)
         return;
     }
 
-    // 1. Process MLB Agent actions (Cell Individual Offsets / CIO), one entry per real cell,
-    // mirroring the "cells" shape used for the KPI payload sent to Python.
+    // Each cell's entry may carry MLB's action, MRO's action, both or
+    // neither -- the two agents act on independent parameters (CIO biases the
+    // handover ranking, ho_margin_db biases whether a handover triggers at
+    // all), so they are checked independently rather than one gating the
+    // other the way a single "continue if this key is missing" used to.
     for (auto& [cellIdStr, cellAction] : actionPayload["cells"].items())
     {
-        if (!cellAction.is_object() || !cellAction.contains("cio_offset"))
+        if (!cellAction.is_object())
         {
             continue;
         }
         uint16_t cellId = std::stoi(cellIdStr);
-        double cioDb = cellAction["cio_offset"].get<double>();
 
-        // Re-use the implementation
-        m_rrc->SetCellIndividualOffset(cellId, cioDb);
+        // 1. MLB Agent action (Cell Individual Offset / CIO), one entry per
+        // real cell, mirroring the "cells" shape used for the KPI payload
+        // sent to Python.
+        if (cellAction.contains("cio_offset"))
+        {
+            double cioDb = cellAction["cio_offset"].get<double>();
+            // Re-use the implementation
+            m_rrc->SetCellIndividualOffset(cellId, cioDb);
+        }
+
+        // 2. MRO Agent action (handover-margin OFFSET, added to the base
+        // HoSinrDifference rather than replacing it -- see
+        // LteEnbRrc::GetEffectiveSinrThreshold).
+        if (cellAction.contains("ho_margin_db"))
+        {
+            double marginDb = cellAction["ho_margin_db"].get<double>();
+            m_rrc->SetHandoverMarginOffset(cellId, marginDb);
+        }
     }
 
-    // 2. Future hooks for COC and MRO agents can be added here cleanly, e.g.
-    // actionPayload["cells"][cellId]["tx_power_dbm"], ["ho_margin_db"], etc.
+    // 3. Future hook for the COC agent can be added here cleanly, e.g.
+    // actionPayload["cells"][cellId]["tx_power_dbm"].
 }
 
 

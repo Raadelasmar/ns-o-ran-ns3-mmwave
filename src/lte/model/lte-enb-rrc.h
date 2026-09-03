@@ -1658,6 +1658,31 @@ class LteEnbRrc : public Object
     bool SetCellIndividualOffset(uint16_t cellId, double cioDb);
 
     /**
+     * Set the MRO handover-margin OFFSET for a mmWave/NR BS, in dB, ADDED to
+     * the base HoSinrDifference attribute (not replacing it) when that cell is
+     * evaluated as a handover candidate (maxSinrCellId). Unlike CIO, this does
+     * not require the cell to already be known: the offset is stored
+     * regardless, and is only ever consulted for a cellId that has already
+     * produced a real SINR report by construction (see
+     * GetEffectiveSinrThreshold), so there is no failure mode to report.
+     * @params cellId
+     * @params offsetDb the offset in dB, clamped to [-3, +3]
+     */
+    void SetHandoverMarginOffset(uint16_t cellId, double offsetDb);
+
+    /**
+     * The effective SINR-difference margin a candidate cell must clear before
+     * a handover to it is considered, i.e. the base HoSinrDifference attribute
+     * plus that cell's own MRO margin offset (0 dB if never set). Used
+     * wherever the code used to compare directly against
+     * m_sinrThresholdDifference, so a per-cell MRO action can bias, without
+     * replacing, the network's base hysteresis.
+     * @params targetCellId the candidate cell being evaluated (maxSinrCellId
+     *     at every call site)
+     */
+    long double GetEffectiveSinrThreshold(uint16_t targetCellId) const;
+
+    /**
      * Evict users from secondary cells that have deactivated forcing handover to another cell
      */
     void EvictUsersFromSecondaryCell();
@@ -2034,6 +2059,15 @@ class LteEnbRrc : public Object
     HandoverEventMap m_imsiHandoverEventsMap;
 
     long double m_sinrThresholdDifference;
+
+    // Per-cell MRO handover-margin OFFSET in dB, added to
+    // m_sinrThresholdDifference by GetEffectiveSinrThreshold(). Keyed by the
+    // candidate/target cell being evaluated for a handover, mirroring
+    // m_cellIndividualOffset's own per-cell shape. Absent entry means 0 dB
+    // offset (the network's base hysteresis, unchanged), so this is inert
+    // until an MRO action actually sets it -- same "inert by default"
+    // convention as every other RL-driven knob in this file.
+    std::map<uint16_t, double> m_hysteresisMarginOffset;
 
     long double m_outageThreshold;
 

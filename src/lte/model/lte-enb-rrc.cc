@@ -4273,7 +4273,7 @@ LteEnbRrc::TttBasedHandover(std::map<uint64_t, CellSinrMap>::iterator imsiIter,
                 double originalTargetSinrDb =
                     10 * std::log10(m_imsiCellSinrMap.find(imsi)->second[targetCellId]);
                 if (maxSinrDb - originalTargetSinrDb >
-                    m_sinrThresholdDifference) // this parameter is the same as the one for
+                    GetEffectiveSinrThreshold(maxSinrCellId)) // this parameter is the same as the one for
                                                // ThresholdBasedSecondaryCellHandover
                 {
                     // delete this event
@@ -4295,7 +4295,7 @@ LteEnbRrc::TttBasedHandover(std::map<uint64_t, CellSinrMap>::iterator imsiIter,
                         // delete this event
                         NS_LOG_INFO("-------------- The difference between the two mmWave SINR is "
                                     "smaller than "
-                                    << m_sinrThresholdDifference
+                                    << GetEffectiveSinrThreshold(maxSinrCellId)
                                     << " dB, but the new max is the current cell, thus cancel the "
                                        "handover");
                         handoverEvent->second.scheduledHandoverEvent.Cancel();
@@ -4305,7 +4305,7 @@ LteEnbRrc::TttBasedHandover(std::map<uint64_t, CellSinrMap>::iterator imsiIter,
                     {
                         NS_LOG_INFO("-------------- The difference between the two mmWave SINR is "
                                     "smaller than "
-                                    << m_sinrThresholdDifference
+                                    << GetEffectiveSinrThreshold(maxSinrCellId)
                                     << " dB, do not cancel the handover");
                     }
                 }
@@ -4567,7 +4567,7 @@ LteEnbRrc::ThresholdBasedSecondaryCellHandover(std::map<uint64_t, CellSinrMap>::
     if (maxSinrCellId == m_bestMmWaveCellForImsiMap.at(imsi) && !m_imsiUsingLte[imsi])
     {
         if (alreadyAssociatedImsi && !onHandoverImsi && m_lastMmWaveCell[imsi] != maxSinrCellId &&
-            sinrDifference > m_sinrThresholdDifference) // not on LTE, handover between MmWave cells
+            sinrDifference > GetEffectiveSinrThreshold(maxSinrCellId)) // not on LTE, handover between MmWave cells
         // this may happen when channel changes while there is an handover
         {
             NS_LOG_INFO("----- handover from " << m_lastMmWaveCell[imsi] << " to " << maxSinrCellId
@@ -4595,7 +4595,7 @@ LteEnbRrc::ThresholdBasedSecondaryCellHandover(std::map<uint64_t, CellSinrMap>::
         }
         else if (alreadyAssociatedImsi && !onHandoverImsi &&
                  m_lastMmWaveCell[imsi] != maxSinrCellId &&
-                 sinrDifference < m_sinrThresholdDifference)
+                 sinrDifference < GetEffectiveSinrThreshold(maxSinrCellId))
         {
             NS_LOG_INFO("----- handover from " << m_lastMmWaveCell[imsi] << " to " << maxSinrCellId
                                                << " not triggered due to small diff "
@@ -4646,7 +4646,7 @@ LteEnbRrc::ThresholdBasedSecondaryCellHandover(std::map<uint64_t, CellSinrMap>::
         }
         else if (alreadyAssociatedImsi && !onHandoverImsi &&
                  m_lastMmWaveCell[imsi] != maxSinrCellId &&
-                 sinrDifference > m_sinrThresholdDifference)
+                 sinrDifference > GetEffectiveSinrThreshold(maxSinrCellId))
         // not on LTE, handover between MmWave cells
         {
             // The new secondary cell HO procedure does not require to switch to LTE
@@ -4668,7 +4668,7 @@ LteEnbRrc::ThresholdBasedSecondaryCellHandover(std::map<uint64_t, CellSinrMap>::
         }
         else if (alreadyAssociatedImsi && !onHandoverImsi &&
                  m_lastMmWaveCell[imsi] != maxSinrCellId &&
-                 sinrDifference < m_sinrThresholdDifference)
+                 sinrDifference < GetEffectiveSinrThreshold(maxSinrCellId))
         {
             NS_LOG_INFO("----- handover from " << m_lastMmWaveCell[imsi] << " to " << maxSinrCellId
                                                << " not triggered due to small diff "
@@ -4870,7 +4870,7 @@ LteEnbRrc::ThresholdBasedInterRatHandover(std::map<uint64_t, CellSinrMap>::itera
     if (maxSinrCellId == m_bestMmWaveCellForImsiMap.at(imsi) && !m_imsiUsingLte.at(imsi))
     {
         if (alreadyAssociatedImsi && !onHandoverImsi && m_lastMmWaveCell[imsi] != maxSinrCellId &&
-            sinrDifference > m_sinrThresholdDifference) // not on LTE, handover between MmWave cells
+            sinrDifference > GetEffectiveSinrThreshold(maxSinrCellId)) // not on LTE, handover between MmWave cells
         // this may happen when channel changes while there is an handover
         {
             NS_LOG_INFO("----- handover from " << m_lastMmWaveCell[imsi] << " to " << maxSinrCellId
@@ -4890,7 +4890,7 @@ LteEnbRrc::ThresholdBasedInterRatHandover(std::map<uint64_t, CellSinrMap>::itera
         }
         else if (alreadyAssociatedImsi && !onHandoverImsi &&
                  m_lastMmWaveCell[imsi] != maxSinrCellId &&
-                 sinrDifference < m_sinrThresholdDifference)
+                 sinrDifference < GetEffectiveSinrThreshold(maxSinrCellId))
         {
             NS_LOG_INFO("----- handover from " << m_lastMmWaveCell[imsi] << " to " << maxSinrCellId
                                                << " not triggered due to small diff "
@@ -4911,7 +4911,7 @@ LteEnbRrc::ThresholdBasedInterRatHandover(std::map<uint64_t, CellSinrMap>::itera
         else if (!m_imsiUsingLte[imsi] && alreadyAssociatedImsi && !onHandoverImsi &&
                  m_lastMmWaveCell[imsi] != maxSinrCellId &&
                  sinrDifference >
-                     m_sinrThresholdDifference) // not on LTE, handover between MmWave cells
+                     GetEffectiveSinrThreshold(maxSinrCellId)) // not on LTE, handover between MmWave cells
         {
             NS_LOG_INFO("----- handover from " << m_lastMmWaveCell[imsi] << " to "
                                                << maxSinrCellId);
@@ -4926,7 +4926,7 @@ LteEnbRrc::ThresholdBasedInterRatHandover(std::map<uint64_t, CellSinrMap>::itera
         }
         else if (alreadyAssociatedImsi && !onHandoverImsi &&
                  m_lastMmWaveCell[imsi] != maxSinrCellId &&
-                 sinrDifference < m_sinrThresholdDifference)
+                 sinrDifference < GetEffectiveSinrThreshold(maxSinrCellId))
         {
             NS_LOG_INFO("----- handover from " << m_lastMmWaveCell[imsi] << " to " << maxSinrCellId
                                                << " not triggered due to small diff "
@@ -6189,6 +6189,33 @@ LteEnbRrc::SetCellIndividualOffset(uint16_t cellId, double cioDb)
         NS_LOG_WARN("CIO requested for unknown cell " << cellId << ", ignored");
         return false;
     }
+}
+
+void
+LteEnbRrc::SetHandoverMarginOffset(uint16_t cellId, double offsetDb)
+{
+    if (offsetDb < -3.0 || offsetDb > 3.0)
+    {
+        double clamped = std::min(std::max(offsetDb, -3.0), 3.0);
+        NS_LOG_WARN("Handover margin offset for cell " << cellId << " requested " << offsetDb
+                                                        << " dB is outside [-3, +3], clamped to "
+                                                        << clamped << " dB");
+        offsetDb = clamped;
+    }
+    // Unlike SetCellIndividualOffset, no "known cell" precondition: operator[]
+    // inserts a fresh entry the first time a cell's offset is set, rather than
+    // requiring one to already exist. See the class declaration for why this
+    // cannot silently apply to a cell that has never reported SINR.
+    m_hysteresisMarginOffset[cellId] = offsetDb;
+    NS_LOG_INFO("Handover margin offset for cell " << cellId << " set to " << offsetDb << " dB");
+}
+
+long double
+LteEnbRrc::GetEffectiveSinrThreshold(uint16_t targetCellId) const
+{
+    auto entry = m_hysteresisMarginOffset.find(targetCellId);
+    long double offsetDb = (entry != m_hysteresisMarginOffset.end()) ? entry->second : 0.0;
+    return m_sinrThresholdDifference + offsetDb;
 }
 
 void

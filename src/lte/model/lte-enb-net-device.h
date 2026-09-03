@@ -72,10 +72,12 @@ class LteEnbNetDevice : public LteNetDevice
     static TypeId GetTypeId(void);
 
     /**
-     * \brief Apply control actions (CIO, Tx Power, etc.) received from the MARL ZeroMQ bridge
+     * \brief Apply control actions (CIO, handover margin, Tx Power, etc.) received from the MARL ZeroMQ bridge
      * \param actionPayload JSON payload of the form
-     *        { "cells": { "<cellId>": { "cio_offset": <dB>, ... }, ... } },
-     *        mirroring the per-cell "cells" shape used for the KPI payload sent to Python
+     *        { "cells": { "<cellId>": { "cio_offset": <dB>, "ho_margin_db": <dB>, ... }, ... } },
+     *        mirroring the per-cell "cells" shape used for the KPI payload sent to Python.
+     *        Both keys are optional per cell and independent of each other (MLB's CIO and
+     *        MRO's handover margin act on different parameters).
      */
     void ApplyControlPayload (const nlohmann::json& actionPayload);
 
