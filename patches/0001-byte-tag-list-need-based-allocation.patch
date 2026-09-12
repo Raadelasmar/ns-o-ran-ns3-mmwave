@@ -1,0 +1,68 @@
+Subject: [PATCH] ByteTagList::Allocate: size to the request, not to a global high-water mark
+
+Stock upstream ns-3 (src/network/model/byte-tag-list.cc, last touched here by
+the ns-3.38 merge 11908797).  Re-apply after any upstream bump.
+
+Problem
+-------
+ByteTagList keeps a monotonically non-decreasing g_maxSize high-water mark
+(byte-tag-list.cc:388, in Deallocate) and Allocate sized every new block as
+max(size, g_maxSize).
+
+In the mmWave O-RAN DL path, RLC AM PDU assembly concatenates N PDCP SDUs via
+Packet::AddAtEnd, and Packet::AddAtEnd merges one byte-tag list per constituent
+SDU (packet.cc:357-361).  A PDU therefore carries tens of PdcpTags, and its tag
+list reaches ~2 kB.  From that moment g_maxSize is ~2 kB permanently, so EVERY
+later ByteTagList allocation -- including a fresh packet needing 28 bytes for a
+single tag -- allocates ~2 kB.
+
+Measured on the 7-cell / 35-UE MARL scenario (seed 868986719): live-set growth
+of 9.29 MB/window in the 2 kB size bucket and 7.15 MB in the 4 kB bucket, all
+attributed by LD_PRELOAD backtrace to ByteTagList::Add under
+McEnbPdcp::DoTransmitPdcpSduLTE and EpcX2::RecvFromX2uSocket.  Because the
+high-water mark only ratchets up, anon RSS per retained backlog byte climbed
+through the episode (9.2 -> 35.4 over 35 steps) instead of staying flat.
+
+The surplus was never usable anyway: Allocate recorded data->size = size (the
+REQUESTED size, not the allocated size), so the free-list reuse test at
+byte-tag-list.cc:363 rejected the oversized block and Deallocate's
+data->size < g_maxSize test at :392 then delete[]'d it.
+
+Fix
+---
+Size the allocation to the request.  This changes no tag semantics -- it only
+stops the ratchet.
+
+Safety
+------
+The free-list reuse path is unaffected and still guards every pop:
+  :358-361  pop  -- data = g_freeList.back(); g_freeList.pop_back();
+  :363      test -- if (data->size >= size) { ... return data; }
+  :369-370  blocks failing the test are delete[]'d, never returned.
+The invariant that matters is data->size <= bytes actually allocated.  Before
+this patch the recorded size UNDERSTATED the allocation (safe but wasteful);
+after it, the two are equal (still safe).  data->size is assigned only at :384
+and :422, in both cases immediately after allocating exactly that many bytes.
+Writes are bounded independently by ByteTagList::Add, which reallocates when
+m_data->size < spaceNeeded before constructing its TagBuffer.
+
+--- a/src/network/model/byte-tag-list.cc
++++ b/src/network/model/byte-tag-list.cc
+@@ -369,7 +369,16 @@
+         uint8_t* buffer = (uint8_t*)data;
+         delete[] buffer;
+     }
+-    uint8_t* buffer = new uint8_t[std::max(size, g_maxSize) + sizeof(struct ByteTagListData) - 4];
++    // Need-based, not high-water-mark based.  The old expression allocated
++    // max(size, g_maxSize) while recording data->size = size, so once any one
++    // packet's tag list grew large (RLC AM PDU assembly merges one tag list per
++    // concatenated SDU, via Packet::AddAtEnd), g_maxSize ratcheted up
++    // permanently and EVERY later tag list -- including a fresh packet needing
++    // 28 bytes for a single tag -- paid that size.  The surplus was never
++    // usable either: the recorded data->size stayed at the requested value, so
++    // the free-list reuse test below rejected the oversized block anyway.
++    // Sizing to the request changes no tag semantics; it only stops the ratchet.
++    uint8_t* buffer = new uint8_t[size + sizeof(struct ByteTagListData) - 4];
+     struct ByteTagListData* data = (struct ByteTagListData*)buffer;
+     data->count = 1;
+     data->size = size;

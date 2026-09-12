@@ -369,7 +369,16 @@ ByteTagList::Allocate(uint32_t size)
         uint8_t* buffer = (uint8_t*)data;
         delete[] buffer;
     }
-    uint8_t* buffer = new uint8_t[std::max(size, g_maxSize) + sizeof(struct ByteTagListData) - 4];
+    // Need-based, not high-water-mark based.  The old expression allocated
+    // max(size, g_maxSize) while recording data->size = size, so once any one
+    // packet's tag list grew large (RLC AM PDU assembly merges one tag list per
+    // concatenated SDU, via Packet::AddAtEnd), g_maxSize ratcheted up
+    // permanently and EVERY later tag list -- including a fresh packet needing
+    // 28 bytes for a single tag -- paid that size.  The surplus was never
+    // usable either: the recorded data->size stayed at the requested value, so
+    // the free-list reuse test below rejected the oversized block anyway.
+    // Sizing to the request changes no tag semantics; it only stops the ratchet.
+    uint8_t* buffer = new uint8_t[size + sizeof(struct ByteTagListData) - 4];
     struct ByteTagListData* data = (struct ByteTagListData*)buffer;
     data->count = 1;
     data->size = size;
