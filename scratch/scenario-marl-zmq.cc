@@ -471,6 +471,39 @@ static ns3::GlobalValue g_udpFullBufferIntervalUs (
     " 500 = the historical 20.96 Mbps per UE. Larger = less offered DL load.",
     ns3::UintegerValue (500), ns3::MakeUintegerChecker<uint32_t> ());
 
+// DL offered-load knobs for the trafficModel=3 BURSTY UEs (u % 4 == 1, 2, 3).
+//
+// These used to be UPLINK TCP OnOff applications installed on the UE nodes
+// (clientHelperTcp*.Install(ueNodes.Get(u)) with Remote = remoteHost). Every
+// reward term and every observation field in MlbZmqEnv measures DOWNLINK --
+// DL PRB, DL RLC buffer_bytes, DL MAC volume_bytes, DlE2PdcpStats -- so 26 of
+// the 35 UEs at ues=5 were invisible to the agent: measured DL PRB on cells
+// carrying no full-buffer UE was 0.0054 over 63,098 cell-steps, and the 26
+// bursty UEs delivered 0.71 Mbps of DL between them (TCP ACKs). A downlink
+// load-balancing agent cannot balance load that is not on the downlink: CIO
+// moved UE COUNT at r = +0.42 but DL PRB at only r = +0.037.
+//
+// They are now DOWNLINK UDP OnOff flows (sink on the UE, source on the remote
+// host). UDP rather than TCP deliberately: TCP would adapt its rate to the
+// radio, so a congested cell would back off and partly self-correct the very
+// imbalance the agent is meant to fix, and the agent's own action would change
+// the offered load. UDP keeps offered load open-loop.
+//
+// OnTime/OffTime are ExponentialRandomVariable with the default Mean = 1.0, so
+// the duty cycle is 50% and the MEAN rate is HALF the DataRate set here.
+static ns3::GlobalValue g_burstyDlRate1 (
+    "burstyDlRate1", "DataRate of the trafficModel=3 u%4==1 DL bursty UEs"
+    " (mean offered load is half this, 50% duty cycle).",
+    ns3::StringValue ("5Mbps"), ns3::MakeStringChecker ());
+static ns3::GlobalValue g_burstyDlRate2 (
+    "burstyDlRate2", "DataRate of the trafficModel=3 u%4==2 DL bursty UEs"
+    " (mean offered load is half this, 50% duty cycle).",
+    ns3::StringValue ("3Mbps"), ns3::MakeStringChecker ());
+static ns3::GlobalValue g_burstyDlRate3 (
+    "burstyDlRate3", "DataRate of the trafficModel=3 u%4==3 DL bursty UEs"
+    " (mean offered load is half this, 50% duty cycle).",
+    ns3::StringValue ("1.5Mbps"), ns3::MakeStringChecker ());
+
 static ns3::GlobalValue g_trafficModel (
     "trafficModel",
     "Type of the traffic model at the transport layer [0,3],"
@@ -675,6 +708,13 @@ main (int argc, char *argv[])
   uint32_t udpFullBufferIntervalUs = uintegerValue.Get ();
   GlobalValue::GetValueByName ("zmqPort", uintegerValue);
   uint16_t zmqPort = uintegerValue.Get ();
+  StringValue stringValueTmp;
+  GlobalValue::GetValueByName ("burstyDlRate1", stringValueTmp);
+  std::string burstyDlRate1 = stringValueTmp.Get ();
+  GlobalValue::GetValueByName ("burstyDlRate2", stringValueTmp);
+  std::string burstyDlRate2 = stringValueTmp.Get ();
+  GlobalValue::GetValueByName ("burstyDlRate3", stringValueTmp);
+  std::string burstyDlRate3 = stringValueTmp.Get ();
   DoubleValue doubleValueTmp;
   GlobalValue::GetValueByName ("controlInterval", doubleValueTmp);
   double controlIntervalCfg = doubleValueTmp.Get ();
@@ -1132,6 +1172,35 @@ main (int argc, char *argv[])
   clientHelperUdp.SetAttribute ("DataRate", StringValue (dataRate));
   clientHelperUdp.SetAttribute ("PacketSize", UintegerValue (1280));
 
+  // DOWNLINK bursty flows for trafficModel=3 (see g_burstyDlRate1). The sink
+  // lives on the UE and the OnOff source on the remote host, which is the
+  // opposite of clientHelperTcp*/clientHelperUdp above. Port 1235 keeps these
+  // clear of the full-buffer UDP flows on 1234, so DlE2PdcpStats attributes
+  // them to the right bearer and Satisfaction -- which selects UEs by IMSI via
+  // MlbZmqEnv._udp_imsis, (imsi-1) % 4 == 0 -- is unaffected.
+  uint16_t portUdpDl = 1235;
+  PacketSinkHelper sinkHelperUdpDl (
+      "ns3::UdpSocketFactory",
+      Address (InetSocketAddress (Ipv4Address::GetAny (), portUdpDl)));
+
+  OnOffHelper clientHelperUdpDl1 ("ns3::UdpSocketFactory", Address ());
+  clientHelperUdpDl1.SetAttribute ("OnTime", StringValue ("ns3::ExponentialRandomVariable"));
+  clientHelperUdpDl1.SetAttribute ("OffTime", StringValue ("ns3::ExponentialRandomVariable"));
+  clientHelperUdpDl1.SetAttribute ("DataRate", StringValue (burstyDlRate1));
+  clientHelperUdpDl1.SetAttribute ("PacketSize", UintegerValue (1280));
+
+  OnOffHelper clientHelperUdpDl2 ("ns3::UdpSocketFactory", Address ());
+  clientHelperUdpDl2.SetAttribute ("OnTime", StringValue ("ns3::ExponentialRandomVariable"));
+  clientHelperUdpDl2.SetAttribute ("OffTime", StringValue ("ns3::ExponentialRandomVariable"));
+  clientHelperUdpDl2.SetAttribute ("DataRate", StringValue (burstyDlRate2));
+  clientHelperUdpDl2.SetAttribute ("PacketSize", UintegerValue (1280));
+
+  OnOffHelper clientHelperUdpDl3 ("ns3::UdpSocketFactory", Address ());
+  clientHelperUdpDl3.SetAttribute ("OnTime", StringValue ("ns3::ExponentialRandomVariable"));
+  clientHelperUdpDl3.SetAttribute ("OffTime", StringValue ("ns3::ExponentialRandomVariable"));
+  clientHelperUdpDl3.SetAttribute ("DataRate", StringValue (burstyDlRate3));
+  clientHelperUdpDl3.SetAttribute ("PacketSize", UintegerValue (1280));
+
   ApplicationContainer clientApp;
   switch (trafficModel)
     {
@@ -1231,19 +1300,19 @@ main (int argc, char *argv[])
 
                 clientApp.Add (dlClient.Install (remoteHost));
               }
-            else if (u % 4 == 1)
+            else if (u % 4 == 1 || u % 4 == 2 || u % 4 == 3)
               {
-                if (configuration == 2)
-                  clientHelperTcp.SetAttribute ("DataRate", StringValue ("20Mbps"));
-                clientApp.Add (clientHelperTcp.Install (ueNodes.Get (u)));
-              }
-            else if (u % 4 == 2)
-              {
-                clientApp.Add (clientHelperTcp750.Install (ueNodes.Get (u)));
-              }
-            else if (u % 4 == 3)
-              {
-                clientApp.Add (clientHelperTcp150.Install (ueNodes.Get (u)));
+                // DOWNLINK bursty UDP: sink on the UE, source on the remote
+                // host. Was UPLINK TCP installed on the UE, which no reward
+                // term could see -- see g_burstyDlRate1 for the measurements.
+                sinkApp.Add (sinkHelperUdpDl.Install (ueNodes.Get (u)));
+                AddressValue ueDlAddr (
+                    InetSocketAddress (ueIpIface.GetAddress (u), portUdpDl));
+                OnOffHelper &dlHelper = (u % 4 == 1)   ? clientHelperUdpDl1
+                                        : (u % 4 == 2) ? clientHelperUdpDl2
+                                                       : clientHelperUdpDl3;
+                dlHelper.SetAttribute ("Remote", ueDlAddr);
+                clientApp.Add (dlHelper.Install (remoteHost));
               }
           }
         break;
