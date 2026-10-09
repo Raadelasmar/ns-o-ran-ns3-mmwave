@@ -386,7 +386,30 @@ TcpHeader::Deserialize(Buffer::Iterator start)
             NS_LOG_WARN("Option kind " << static_cast<int>(kind) << " unknown, skipping.");
         }
         optionSize = op->Deserialize(i);
-        if (optionSize != op->GetSerializedSize())
+        // A zero-size option makes no forward progress, and on a malformed
+        // header that is unbounded rather than merely wrong.
+        //
+        // TcpOptionUnknown::Deserialize (tcp-option.cc) returns 0 for an option
+        // whose length byte is outside [2,40], but it has already assigned that
+        // byte to m_size, and GetSerializedSize() returns m_size. So when the
+        // length byte reads exactly 0 the check below compares 0 != 0, does not
+        // break, and the loop then does `optionLen -= 0` and `i.Next(0)`: the
+        // loop condition is unchanged and the iterator does not move, while
+        // m_options.emplace_back(op) retains one new TcpOption every iteration.
+        //
+        // This is reachable without any TCP traffic. Ipv4QueueDiscItem::Hash
+        // peeks a TcpHeader on anything whose IPv4 protocol field is 6, so a
+        // packet that merely looks like TCP is enough. On 2026-09-12 it took one
+        // ns-3 worker from 171 MB to 20.9 GB inside a single control step and
+        // the cgroup OOM killer ended the run; the capture is in
+        // ns-o-ran-gym/analysis/leak_hunt2/ (gdb stack at
+        // TcpOption::CreateOption <- TcpHeader::Deserialize <-
+        // Ipv4QueueDiscItem::Hash <- FqCoDelQueueDisc::DoEnqueue, 80-byte
+        // allocations, growth confined to [heap]).
+        //
+        // Terminating on zero progress cannot affect a well-formed option: every
+        // real option serializes to at least one byte (END and NOP are 1).
+        if (optionSize == 0 || optionSize != op->GetSerializedSize())
         {
             NS_LOG_ERROR("Option did not deserialize correctly");
             break;

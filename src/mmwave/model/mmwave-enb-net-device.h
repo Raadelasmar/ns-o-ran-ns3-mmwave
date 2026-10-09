@@ -191,6 +191,18 @@ class MmWaveEnbNetDevice : public MmWaveNetDevice
      */
     std::map<uint64_t, double> DrainMarlDlRxBytes(double& windowSeconds);
 
+    /**
+     * @brief MARL: this cell's DL SINR bin counts (7 bins, same order as
+     * L1M.RS-SINR) from the last DU report build, banked there before
+     * ResetPhyTracesForRntiCellId empties the live counters.
+     *
+     * Only filled when the MarlBankSinrBins attribute is true; all zeros
+     * otherwise. Needed when the MARL control step runs just AFTER the report
+     * (scenario-marl-zmq.cc controlPhaseOffsetS > 0): by then the live
+     * counters cover only the time since that reset.
+     */
+    std::vector<uint32_t> GetMarlBankedSinrBins() const;
+
     void SetTurnOffTime(double value);
 
     double GetTurnOffTime();
@@ -326,6 +338,10 @@ class MmWaveEnbNetDevice : public MmWaveNetDevice
     std::map<uint64_t, double> m_marlDlRxBytes;
     /** @brief Simulated time (s) of the last DrainMarlDlRxBytes() call. */
     double m_marlLastDrainSeconds = 0.0;
+    /** @brief Attribute MarlBankSinrBins: bank the SINR bins at each DU report build. */
+    bool m_marlBankSinrBins = false;
+    /** @brief SINR bins banked by the last DU report build. See GetMarlBankedSinrBins(). */
+    std::vector<uint32_t> m_marlBankedSinrBins = std::vector<uint32_t>(7, 0);
     /**
      * @brief Attribute representing the macVolumeCellSpecific value for the cell
      *
