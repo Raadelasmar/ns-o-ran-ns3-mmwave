@@ -1746,6 +1746,58 @@ class LteEnbRrc : public Object
     uint8_t ComputeTtt(double sinrDifference);
 
     /**
+     * CIO-biased L3 SINR of a cell for a UE, in dB: the value the handover
+     * ranking compares (raw SINR times the cell's linear CIO). -infinity if
+     * there is no report for that UE and cell.
+     */
+    double GetCioBiasedSinrDb(uint64_t imsi, uint16_t cellId) const;
+
+    /**
+     * HandoverHysteresisDb gate for TTT-based handover. True when the
+     * attribute is 0 (no gate, previous behaviour), when the serving cell is in
+     * outage (never delay an outage escape), or when the target's CIO-biased
+     * SINR exceeds the serving cell's by more than HandoverHysteresisDb.
+     */
+    bool HysteresisAllowsHandover(uint64_t imsi,
+                                  uint16_t targetCellId,
+                                  double currentSinrDb) const;
+
+    /**
+     * SINR difference fed to ComputeTtt: the raw difference passed in by
+     * default, or |biased target - biased serving| when TttFromBiasedSinr.
+     */
+    double TttSinrDifference(uint64_t imsi, uint16_t targetCellId, double rawSinrDifference) const;
+
+    /**
+     * Consistency check, run only when HandoverHysteresisDb > 0 or
+     * TttFromBiasedSinr: aborts unless GetCioBiasedSinrDb ranks argmaxCellId
+     * at least as high as every other candidate in cells, i.e. the helper
+     * agrees with the inline CIO-biased argmax that picked argmaxCellId.
+     * skipBarred mirrors argmax loops that ignore cells in m_allowHandoverTo
+     * set to false. No-op when argmaxCellId is 0 (nothing picked).
+     */
+    void CheckCioHelperMatchesArgmax(uint64_t imsi,
+                                     const CellSinrMap& cells,
+                                     uint16_t argmaxCellId,
+                                     bool skipBarred) const;
+
+  public:
+    /**
+     * SINR (dB) the handover decision currently uses for this UE and cell: the
+     * HandoverSinrFilterTauMs-filtered value when that attribute is > 0, the
+     * latest raw report otherwise. NaN if unknown. For logging only.
+     */
+    double GetHandoverDecisionSinrDb(uint64_t imsi, uint16_t cellId) const;
+
+  private:
+    /**
+     * Raw (unfiltered) SINR (dB) of the latest report for this UE and cell,
+     * used for outage detection when HandoverSinrFilterTauMs > 0. -infinity if
+     * unknown.
+     */
+    double GetRawSinrDb(uint64_t imsi, uint16_t cellId) const;
+
+    /**
      * Method that can be scheduled to perform an handover
      * @params imsi
      */
@@ -2044,6 +2096,14 @@ class LteEnbRrc : public Object
     double m_maxDiffTttValue;
 
     int m_crtPeriod;
+
+    double m_handoverHysteresisDb{0.0}; ///< attribute HandoverHysteresisDb
+    double m_handoverSinrFilterTauMs{0.0}; ///< attribute HandoverSinrFilterTauMs
+    /// Raw SINR (linear) per IMSI and cell; only maintained when the filter is on.
+    std::map<uint64_t, CellSinrMap> m_imsiCellSinrRawMap;
+    /// Filter state per IMSI and cell: (filtered SINR in dB, time of last update in s).
+    std::map<uint64_t, std::map<uint16_t, std::pair<double, double>>> m_sinrFilterState;
+    bool m_tttFromBiasedSinr{false};    ///< attribute TttFromBiasedSinr
 
     uint32_t m_x2_received_cnt;
 

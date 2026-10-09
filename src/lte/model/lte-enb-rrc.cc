@@ -53,6 +53,7 @@
 #include <ns3/packet.h>
 #include <ns3/pointer.h>
 #include <ns3/simulator.h>
+#include <limits>
 
 namespace ns3
 {
@@ -3320,6 +3321,32 @@ LteEnbRrc::GetTypeId(void)
                           IntegerValue(1600),
                           MakeIntegerAccessor(&LteEnbRrc::m_crtPeriod),
                           MakeIntegerChecker<int>()) // TODO consider using a TimeValue
+            .AddAttribute("HandoverHysteresisDb",
+                          "TTT-based secondary-cell handover: trigger (and keep a pending "
+                          "handover) only while the target's CIO-biased SINR exceeds the "
+                          "serving cell's CIO-biased SINR by more than this many dB. Outage "
+                          "escapes are exempt. 0 disables the check (previous behaviour).",
+                          DoubleValue(0.0),
+                          MakeDoubleAccessor(&LteEnbRrc::m_handoverHysteresisDb),
+                          MakeDoubleChecker<double>(0.0))
+            .AddAttribute("HandoverSinrFilterTauMs",
+                          "Time constant (ms) of an L3-style exponential filter, in the dB "
+                          "domain, applied per (UE, cell) to the SINR reports the secondary-cell "
+                          "handover decision uses (argmax, hysteresis, TTT). alpha = "
+                          "1 - exp(-dt / tau) for the actual interval dt between a pair's "
+                          "reports; the first report initialises the filter. Outage detection "
+                          "keeps the raw values. 0 disables the filter (previous behaviour).",
+                          DoubleValue(0.0),
+                          MakeDoubleAccessor(&LteEnbRrc::m_handoverSinrFilterTauMs),
+                          MakeDoubleChecker<double>(0.0))
+            .AddAttribute("TttFromBiasedSinr",
+                          "DynamicTtt: compute the TTT from the CIO-biased SINR difference "
+                          "(target minus serving) instead of the raw one, so a CIO-forced move "
+                          "to a cell with much lower raw SINR does not get a shorter TTT. "
+                          "false = previous behaviour.",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&LteEnbRrc::m_tttFromBiasedSinr),
+                          MakeBooleanChecker())
             .AddAttribute("ReportAllUeMeas",
                           "If true, the MmWave eNB sends to the LTE coordinator all the received "
                           "UE measures (one per CC). If false, it sends only the maximum measures",
@@ -4066,6 +4093,29 @@ LteEnbRrc::DoRecvUeSinrUpdate(EpcX2SapUser::UeImsiSinrParams params)
 
         m_notifyMmWaveSinrTrace(imsi, mmWaveCellId, sinr);
 
+        if (m_handoverSinrFilterTauMs > 0.0)
+        {
+            // HandoverSinrFilterTauMs: keep the raw report for outage detection,
+            // and store the filtered value where the handover decision reads it.
+            m_imsiCellSinrRawMap[imsi][mmWaveCellId] = sinr;
+            double nowS = Simulator::Now().GetSeconds();
+            double xDb = 10.0 * std::log10(sinr);
+            auto& cellState = m_sinrFilterState[imsi];
+            auto st = cellState.find(mmWaveCellId);
+            if (st == cellState.end())
+            {
+                cellState[mmWaveCellId] = std::make_pair(xDb, nowS); // first sample
+            }
+            else
+            {
+                double dt = nowS - st->second.second;
+                double alpha = 1.0 - std::exp(-dt / (m_handoverSinrFilterTauMs * 1e-3));
+                st->second.first += alpha * (xDb - st->second.first);
+                st->second.second = nowS;
+            }
+            sinr = std::pow(10.0, cellState[mmWaveCellId].first / 10.0);
+        }
+
         NS_LOG_LOGIC("Imsi " << imsi << " sinr " << sinr);
 
         if (m_imsiCellSinrMap.find(imsi) != m_imsiCellSinrMap.end())
@@ -4129,6 +4179,127 @@ LteEnbRrc::DoRecvUeSinrUpdate(EpcX2SapUser::UeImsiSinrParams params)
     }
 }
 
+double
+LteEnbRrc::GetCioBiasedSinrDb(uint64_t imsi, uint16_t cellId) const
+{
+    auto imsiIt = m_imsiCellSinrMap.find(imsi);
+    if (imsiIt == m_imsiCellSinrMap.end())
+    {
+        return -std::numeric_limits<double>::infinity();
+    }
+    auto cellIt = imsiIt->second.find(cellId);
+    if (cellIt == imsiIt->second.end())
+    {
+        return -std::numeric_limits<double>::infinity();
+    }
+    auto cioIt = m_cellIndividualOffset.find(cellId);
+    double cio = (cioIt != m_cellIndividualOffset.end()) ? cioIt->second : 1.0;
+    return 10.0 * std::log10(cellIt->second * cio);
+}
+
+double
+LteEnbRrc::GetHandoverDecisionSinrDb(uint64_t imsi, uint16_t cellId) const
+{
+    auto imsiIt = m_imsiCellSinrMap.find(imsi);
+    if (imsiIt == m_imsiCellSinrMap.end())
+    {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    auto cellIt = imsiIt->second.find(cellId);
+    if (cellIt == imsiIt->second.end())
+    {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    return 10.0 * std::log10(cellIt->second);
+}
+
+double
+LteEnbRrc::GetRawSinrDb(uint64_t imsi, uint16_t cellId) const
+{
+    const auto& source =
+        (m_handoverSinrFilterTauMs > 0.0) ? m_imsiCellSinrRawMap : m_imsiCellSinrMap;
+    auto imsiIt = source.find(imsi);
+    if (imsiIt == source.end())
+    {
+        return -std::numeric_limits<double>::infinity();
+    }
+    auto cellIt = imsiIt->second.find(cellId);
+    if (cellIt == imsiIt->second.end())
+    {
+        return -std::numeric_limits<double>::infinity();
+    }
+    return 10.0 * std::log10(cellIt->second);
+}
+
+bool
+LteEnbRrc::HysteresisAllowsHandover(uint64_t imsi,
+                                    uint16_t targetCellId,
+                                    double currentSinrDb) const
+{
+    if (m_handoverHysteresisDb <= 0.0)
+    {
+        return true; // attribute off: no gate at all, previous behaviour
+    }
+    if (currentSinrDb < m_outageThreshold)
+    {
+        return true; // never hold a UE in an outage cell
+    }
+    auto servingIt = m_lastMmWaveCell.find(imsi);
+    if (servingIt == m_lastMmWaveCell.end())
+    {
+        return true;
+    }
+    return GetCioBiasedSinrDb(imsi, targetCellId) - GetCioBiasedSinrDb(imsi, servingIt->second) >
+           m_handoverHysteresisDb;
+}
+
+double
+LteEnbRrc::TttSinrDifference(uint64_t imsi, uint16_t targetCellId, double rawSinrDifference) const
+{
+    if (!m_tttFromBiasedSinr)
+    {
+        return rawSinrDifference;
+    }
+    auto servingIt = m_lastMmWaveCell.find(imsi);
+    if (servingIt == m_lastMmWaveCell.end())
+    {
+        return rawSinrDifference;
+    }
+    return std::abs(GetCioBiasedSinrDb(imsi, targetCellId) -
+                    GetCioBiasedSinrDb(imsi, servingIt->second));
+}
+
+void
+LteEnbRrc::CheckCioHelperMatchesArgmax(uint64_t imsi,
+                                       const CellSinrMap& cells,
+                                       uint16_t argmaxCellId,
+                                       bool skipBarred) const
+{
+    if (argmaxCellId == 0)
+    {
+        return;
+    }
+    // Compare with >, not !=: ties may be broken differently, and rounding the
+    // long double argmax product to double can only merge values, never swap them.
+    double best = GetCioBiasedSinrDb(imsi, argmaxCellId);
+    for (const auto& cell : cells)
+    {
+        if (skipBarred)
+        {
+            auto allowIt = m_allowHandoverTo.find(cell.first);
+            if (allowIt != m_allowHandoverTo.end() && !allowIt->second)
+            {
+                continue;
+            }
+        }
+        double candidate = GetCioBiasedSinrDb(imsi, cell.first);
+        NS_ABORT_MSG_IF(candidate > best,
+                        "GetCioBiasedSinrDb disagrees with the CIO-biased argmax for imsi "
+                            << imsi << ": argmax picked cell " << argmaxCellId << " (" << best
+                            << " dB) but cell " << cell.first << " is " << candidate << " dB");
+    }
+}
+
 void
 LteEnbRrc::TttBasedHandover(std::map<uint64_t, CellSinrMap>::iterator imsiIter,
                             double sinrDifference,
@@ -4164,6 +4335,11 @@ LteEnbRrc::TttBasedHandover(std::map<uint64_t, CellSinrMap>::iterator imsiIter,
     {
         currentSinrDb =
             10 * std::log10(m_imsiCellSinrMap.find(imsi)->second[m_lastMmWaveCell[imsi]]);
+        if (m_handoverSinrFilterTauMs > 0.0)
+        {
+            // only used for outage checks below: those must see the raw report
+            currentSinrDb = GetRawSinrDb(imsi, m_lastMmWaveCell[imsi]);
+        }
         NS_LOG_DEBUG("Current SINR " << currentSinrDb);
     }
 
@@ -4228,6 +4404,15 @@ LteEnbRrc::TttBasedHandover(std::map<uint64_t, CellSinrMap>::iterator imsiIter,
         // the UE is connected to a mmWave eNB which was not in outage
         // check if there are HO events pending
         HandoverEventMap::iterator handoverEvent = m_imsiHandoverEventsMap.find(imsi);
+        // HandoverHysteresisDb: drop a pending handover whose target no longer
+        // clears the margin. Always false when the attribute is 0.
+        if (handoverEvent != m_imsiHandoverEventsMap.end() &&
+            !HysteresisAllowsHandover(imsi, handoverEvent->second.targetCellId, currentSinrDb))
+        {
+            handoverEvent->second.scheduledHandoverEvent.Cancel();
+            m_imsiHandoverEventsMap.erase(handoverEvent);
+            handoverEvent = m_imsiHandoverEventsMap.end();
+        }
         if (handoverEvent != m_imsiHandoverEventsMap.end())
         {
             // an handover event is already scheduled
@@ -4246,7 +4431,8 @@ LteEnbRrc::TttBasedHandover(std::map<uint64_t, CellSinrMap>::iterator imsiIter,
                 {
                     // TODO consider if TTT must be updated or if it can remain as computed before
                     // we should compute the new TTT: if Now() + TTT < scheduledTime then update!
-                    uint8_t newTtt = ComputeTtt(sinrDifference);
+                    uint8_t newTtt =
+                        ComputeTtt(TttSinrDifference(imsi, maxSinrCellId, sinrDifference));
                     uint64_t handoverHappensAtTime =
                         handoverEvent->second.scheduledHandoverEvent.GetTs(); // in nanoseconds
                     NS_LOG_INFO("Scheduled for " << handoverHappensAtTime
@@ -4314,7 +4500,9 @@ LteEnbRrc::TttBasedHandover(std::map<uint64_t, CellSinrMap>::iterator imsiIter,
         else
         {
             // check if the maxSinrCellId is different from the current cell
-            if (maxSinrCellId != m_lastMmWaveCell[imsi])
+            // (and, with HandoverHysteresisDb > 0, better by more than the margin)
+            if (maxSinrCellId != m_lastMmWaveCell[imsi] &&
+                HysteresisAllowsHandover(imsi, maxSinrCellId, currentSinrDb))
             {
                 NS_LOG_INFO("----- Handover needed from cell " << m_lastMmWaveCell[imsi] << " to "
                                                                << maxSinrCellId);
@@ -4327,7 +4515,8 @@ LteEnbRrc::TttBasedHandover(std::map<uint64_t, CellSinrMap>::iterator imsiIter,
     {
         NS_LOG_DEBUG("handoverNeeded");
         // compute the TTT
-        uint8_t millisecondsToHandover = ComputeTtt(sinrDifference);
+        uint8_t millisecondsToHandover =
+            ComputeTtt(TttSinrDifference(imsi, maxSinrCellId, sinrDifference));
         NS_LOG_INFO("The sinrDifference is "
                     << sinrDifference << " and the TTT computed is "
                     << (uint32_t)millisecondsToHandover
@@ -4731,7 +4920,9 @@ LteEnbRrc::TriggerUeAssociationUpdate()
                 // check if the BS is barred from HOs and in case ignore it
                 if (m_allowHandoverTo.find(cellIter->first)->second)
                 {
-                    // CIO biases the ranking only; default 1.0 (0 dB) if unset
+                    // CIO biases the ranking only; default 1.0 (0 dB) if unset.
+                    // Same formula as GetCioBiasedSinrDb (hysteresis / biased TTT);
+                    // keep both in sync (checked by CheckCioHelperMatchesArgmax).
                     auto cioIter = m_cellIndividualOffset.find(cellIter->first);
                     long double cio = (cioIter != m_cellIndividualOffset.end())
                                           ? cioIter->second
@@ -4758,6 +4949,10 @@ LteEnbRrc::TriggerUeAssociationUpdate()
                     currentSinr = cellIter->second;
                 }
             }
+            if (m_handoverHysteresisDb > 0.0 || m_tttFromBiasedSinr)
+            {
+                CheckCioHelperMatchesArgmax(imsi, imsiIter->second, maxSinrCellId, true);
+            }
             // The argmax above ranked CIO-biased values. Everything from here on
             // (maxSinrDb, sinrDifference, ComputeTtt, and in particular the
             // outage check against m_outageThreshold below) must see the RAW
@@ -4774,8 +4969,15 @@ LteEnbRrc::TriggerUeAssociationUpdate()
             NS_LOG_INFO("MaxSinr " << maxSinrDb << " in cell " << maxSinrCellId << " current cell "
                                    << m_lastMmWaveCell[imsi] << " currentSinr " << currentSinrDb
                                    << " sinrDifference " << sinrDifference);
-            if ((maxSinrDb < m_outageThreshold ||
-                 (m_imsiUsingLte[imsi] && maxSinrDb < m_outageThreshold + 2)) &&
+            // HandoverSinrFilterTauMs > 0: maxSinrDb is filtered; the outage test
+            // uses the raw report of the same cell instead.
+            long double outageSinrDb = maxSinrDb;
+            if (m_handoverSinrFilterTauMs > 0.0 && maxSinrCellId != 0)
+            {
+                outageSinrDb = GetRawSinrDb(imsi, maxSinrCellId);
+            }
+            if ((outageSinrDb < m_outageThreshold ||
+                 (m_imsiUsingLte[imsi] && outageSinrDb < m_outageThreshold + 2)) &&
                 alreadyAssociatedImsi) // no MmWaveCell can serve this UE
             {
                 // outage, perform fast switching if MC device or hard handover
@@ -4984,7 +5186,9 @@ LteEnbRrc::UpdateUeHandoverAssociation()
                  cellIter != imsiIter->second.end();
                  ++cellIter)
             {
-                // CIO biases the ranking only; default 1.0 (0 dB) if unset
+                // CIO biases the ranking only; default 1.0 (0 dB) if unset.
+                // Same formula as GetCioBiasedSinrDb (hysteresis / biased TTT);
+                // keep both in sync (checked by CheckCioHelperMatchesArgmax).
                 auto cioIter = m_cellIndividualOffset.find(cellIter->first);
                 long double cio =
                     (cioIter != m_cellIndividualOffset.end()) ? cioIter->second : 1.0;
@@ -5001,6 +5205,10 @@ LteEnbRrc::UpdateUeHandoverAssociation()
                 {
                     currentSinr = cellIter->second;
                 }
+            }
+            if (m_handoverHysteresisDb > 0.0 || m_tttFromBiasedSinr)
+            {
+                CheckCioHelperMatchesArgmax(imsi, imsiIter->second, maxSinrCellId, false);
             }
             // The argmax above ranked CIO-biased values. Everything downstream
             // (maxSinrDb, sinrDifference, and the outage check against
@@ -6269,6 +6477,7 @@ LteEnbRrc::EvictUsersFromSecondaryCell()
                     // CIO biases the ranking only; default 1.0 (0 dB) if unset.
                     // No raw re-read is needed after this loop: eviction uses
                     // only maxSinrCellId downstream, never a dB/threshold value.
+                    // Same formula as GetCioBiasedSinrDb; keep both in sync.
                     auto cioIter = m_cellIndividualOffset.find(cellIter->first);
                     long double cio = (cioIter != m_cellIndividualOffset.end())
                                           ? cioIter->second

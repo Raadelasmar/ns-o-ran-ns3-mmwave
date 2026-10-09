@@ -26,6 +26,8 @@
 #include "ns3/point-to-point-helper.h"
 #include <ns3/lte-ue-net-device.h>
 #include "ns3/mmwave-helper.h"
+#include "ns3/channel-condition-model.h"
+#include "ns3/three-gpp-propagation-loss-model.h"
 #include "ns3/epc-helper.h"
 #include "ns3/mmwave-point-to-point-epc-helper.h"
 #include "ns3/lte-helper.h"
@@ -58,6 +60,15 @@ struct MarlHandoverRecord
     uint16_t dstCell;
 };
 static std::vector<MarlHandoverRecord> g_marlHandovers;
+
+// Set from controlPhaseOffsetS (see g_controlPhaseOffsetS). When true, the
+// SINR bins come from the copy banked by the DU report build instead of the
+// live counters, which that build has just reset.
+static bool g_marlUseBankedSinrBins = false;
+
+// Set from handoverSinrFilterTauMs > 0: also emit, per UE, the (filtered) SINR
+// the RRC handover decision uses, as ho_decision_sinr_db. Diagnostic only.
+static bool g_marlEmitHoDecisionSinr = false;
 
 // The signature has to match the UE RRC HandoverStart trace exactly. See
 // MmWaveBearerStatsConnector::NotifyHandoverStartUe.
@@ -152,7 +163,11 @@ void MarlControlStep(ns3::ZmqDatabaseClient* zmqClient,
         ns3::Ptr<ns3::mmwave::MmWavePhyTrace> duCalc =
             duCalcValue.Get<ns3::mmwave::MmWavePhyTrace> ();
         std::vector<uint32_t> sinrBins (7, 0);
-        if (duCalc)
+        if (g_marlUseBankedSinrBins)
+        {
+            sinrBins = mmDev->GetMarlBankedSinrBins ();
+        }
+        else if (duCalc)
         {
             for (auto& ue : ueMap)
             {
@@ -243,6 +258,17 @@ void MarlControlStep(ns3::ZmqDatabaseClient* zmqClient,
             // L3 serving SINR, converted from linear to dB (mirrors
             // BuildRicIndicationMessageCuCp's sinrThisCell computation)
             uesPayload[imsiKey]["l3_serving_sinr_db"] = 10 * std::log10(sinrIt->second);
+            if (g_marlEmitHoDecisionSinr)
+            {
+                // The SINR the RRC's handover decision uses for this UE and
+                // cell (filtered when handoverSinrFilterTauMs > 0). The
+                // agent-facing l3_serving_sinr_db above stays raw.
+                double hoDb = enbDevice->GetRrc ()->GetHandoverDecisionSinrDb (imsi, cellId);
+                if (std::isfinite (hoDb))
+                {
+                    uesPayload[imsiKey]["ho_decision_sinr_db"] = hoDb;
+                }
+            }
         }
         cellPayload["ues"] = uesPayload;
     }
@@ -396,6 +422,44 @@ PrintGnuplottableEnbListToFile (std::string filename)
     }
 }
 
+// logChannelConditions diagnostic: last LOS/NLOS state seen per (UE node, eNB
+// node), and the number of changes observed. Queries the same channel
+// condition model the path-loss model uses, so a link not yet evaluated by the
+// simulation is created (one RNG draw) by the query itself: use only in
+// diagnostic runs, never in a run whose payload must stay byte-identical.
+static std::map<std::pair<uint32_t, uint32_t>, int> g_lastLosCondition;
+static uint64_t g_losConditionChanges = 0;
+
+void
+LogChannelConditions (Ptr<ChannelConditionModel> condModel, NodeContainer ues,
+                      NodeContainer enbs, double period, std::string filename)
+{
+  std::ofstream f (filename, std::ios_base::app);
+  for (uint32_t u = 0; u < ues.GetN (); ++u)
+    {
+      for (uint32_t e = 0; e < enbs.GetN (); ++e)
+        {
+          Ptr<MobilityModel> a = ues.Get (u)->GetObject<MobilityModel> ();
+          Ptr<MobilityModel> b = enbs.Get (e)->GetObject<MobilityModel> ();
+          int c = static_cast<int> (condModel->GetChannelCondition (a, b)->GetLosCondition ());
+          auto key = std::make_pair (ues.Get (u)->GetId (), enbs.Get (e)->GetId ());
+          auto it = g_lastLosCondition.find (key);
+          if (it == g_lastLosCondition.end () || it->second != c)
+            {
+              if (it != g_lastLosCondition.end ())
+                {
+                  g_losConditionChanges++;
+                }
+              g_lastLosCondition[key] = c;
+              f << Simulator::Now ().GetSeconds () << " " << key.first << " " << key.second
+                << " " << c << std::endl;
+            }
+        }
+    }
+  Simulator::Schedule (Seconds (period), &LogChannelConditions, condModel, ues, enbs, period,
+                       filename);
+}
+
 void
 PrintPosition (Ptr<Node> node)
 {
@@ -451,6 +515,72 @@ static ns3::GlobalValue g_controlInterval (
     "controlInterval", "MARL control period T_control in seconds",
     ns3::DoubleValue (1.0), ns3::MakeDoubleChecker<double> (0.01));
 
+// Phase of the MARL control step relative to the E2 report grid, in seconds.
+//
+// The DU/CU-UP report builders run at 0.0008, 0.1008, ... and are the only
+// place prb_utilization, buffer_bytes, volume_bytes and the banked PDCP
+// delivered bytes are refreshed. With the default 0.0 the step at k*T reads
+// the report built 99.2 ms earlier, so every load KPI describes the window
+// BEFORE the previous action (audit_oct_2.md I6). A value just above 0.0008
+// (e.g. 0.001) runs the step right after the report, so step k reads the
+// window ending at k*T + 0.0008.
+//
+// Side effects when > 0, both handled here:
+//  - the live SINR-bin counters are reset by that same report build, so the
+//    bins are taken from a copy banked there (MmWaveEnbNetDevice attribute
+//    MarlBankSinrBins, switched on below);
+//  - the per-UE raw dl_pdcp_delivered_bytes / dl_pdcp_tx_bytes are reset by
+//    the CU-UP build too, so they then cover only the offset minus 0.8 ms.
+//    The env's Satisfaction does not use them (it uses the banked
+//    pdcp_delivered_bytes), but rx/tx validation scripts do.
+// 0.0, the default, reproduces the previous schedule exactly.
+// Secondary-cell handover hysteresis and TTT basis (LteEnbRrc attributes
+// HandoverHysteresisDb / TttFromBiasedSinr, lte-enb-rrc.cc).
+//
+// Without hysteresis a UE is handed over whenever any cell's CIO-biased SINR
+// edges past the serving cell's, so SINR fluctuation alone produced ~0.5
+// handovers per UE per second with ~28% ping-pongs at zero CIO, about 100x
+// the geometric boundary-crossing rate (audit_oct_3.md N). Both default to the
+// previous behaviour, and the attributes are only touched when non-default.
+static ns3::GlobalValue g_handoverHysteresisDb (
+    "handoverHysteresisDb",
+    "Handover margin (dB) on CIO-biased SINR for TTT-based secondary-cell handover. 0 = off.",
+    ns3::DoubleValue (0.0), ns3::MakeDoubleChecker<double> (0.0, 20.0));
+// UpdatePeriod of ns3::ThreeGppChannelConditionModel, in ms. With the
+// historical 100 every UE-cell link re-draws LOS/NLOS independently every
+// 100 ms (ComputeChannelCondition draws a fresh uniform against pLos), which
+// keeps handovers flapping whatever filter or margin is used (audit_oct_5.md
+// V.3). 0 = ns-3's own "never updated": each link's condition is computed once
+// and kept. 100, the default, reproduces the previous behaviour exactly.
+static ns3::GlobalValue g_channelConditionUpdatePeriodMs (
+    "channelConditionUpdatePeriodMs",
+    "UpdatePeriod (ms) of ThreeGppChannelConditionModel. 100 = previous behaviour; "
+    "0 = compute each link's LOS/NLOS once and keep it.",
+    ns3::UintegerValue (100), ns3::MakeUintegerChecker<uint32_t> ());
+// Diagnostic only: log every change of each UE-to-mmWave-cell LOS/NLOS state to
+// channel_conditions.txt, sampled every controlInterval. Perturbs the RNG (see
+// LogChannelConditions). Off by default.
+static ns3::GlobalValue g_logChannelConditions (
+    "logChannelConditions",
+    "Diagnostic: log UE-to-mmWave-cell LOS/NLOS state changes (perturbs the RNG).",
+    ns3::BooleanValue (false), ns3::MakeBooleanChecker ());
+
+static ns3::GlobalValue g_handoverSinrFilterTauMs (
+    "handoverSinrFilterTauMs",
+    "Time constant (ms) of the L3-style SINR filter feeding the handover decision "
+    "(LteEnbRrc HandoverSinrFilterTauMs). 0 = off.",
+    ns3::DoubleValue (0.0), ns3::MakeDoubleChecker<double> (0.0, 10000.0));
+static ns3::GlobalValue g_tttFromBiasedSinr (
+    "tttFromBiasedSinr",
+    "DynamicTtt from the CIO-biased SINR difference instead of the raw one. false = off.",
+    ns3::BooleanValue (false), ns3::MakeBooleanChecker ());
+
+static ns3::GlobalValue g_controlPhaseOffsetS (
+    "controlPhaseOffsetS",
+    "Offset (s) of the MARL control step from the k*controlInterval grid. 0 = previous "
+    "behaviour; ~0.001 = read the E2 report built 0.8 ms into the step.",
+    ns3::DoubleValue (0.0), ns3::MakeDoubleChecker<double> (0.0, 0.05));
+
 // DL offered-load knob for the trafficModel=3 full-buffer UDP UEs (u % 4 == 0).
 //
 // `ues` used to be the only way to change downlink load, but it conflates two
@@ -503,6 +633,89 @@ static ns3::GlobalValue g_burstyDlRate3 (
     "burstyDlRate3", "DataRate of the trafficModel=3 u%4==3 DL bursty UEs"
     " (mean offered load is half this, 50% duty cycle).",
     ns3::StringValue ("1.5Mbps"), ns3::MakeStringChecker ());
+
+// Mean ON and OFF durations (s) of the trafficModel=3 DL bursty UEs, shared by
+// all three bursty classes. Both phases are ExponentialRandomVariable.
+//
+// At the 1.0 s default a cell's instantaneous DL load reshuffles about once a
+// second, faster than a CIO change can usefully follow, so the per-step PRB
+// argmax moved away from the episode's hotspot on ~90% of steps (report §10.3).
+// Raising these makes an imbalance persist long enough to be worth correcting.
+//
+// Duty cycle is ON / (ON + OFF), so the mean offered rate is DataRate times
+// that; keep ON == OFF to keep burstyDlRate*'s "mean is half" reading. Note
+// OnOffApplication starts in OFF: with a mean OFF of T_off, a UE stays silent
+// for a whole episode of length L with probability exp(-L / T_off).
+//
+// The 1.0 defaults reproduce the previous behaviour (Mean=1 is the
+// ExponentialRandomVariable default).
+static ns3::GlobalValue g_burstyOnMeanS (
+    "burstyOnMeanS", "Mean ON duration (s) of the trafficModel=3 DL bursty UEs.",
+    ns3::DoubleValue (1.0), ns3::MakeDoubleChecker<double> (0.001));
+static ns3::GlobalValue g_burstyOffMeanS (
+    "burstyOffMeanS", "Mean OFF duration (s) of the trafficModel=3 DL bursty UEs.",
+    ns3::DoubleValue (1.0), ns3::MakeDoubleChecker<double> (0.001));
+
+// Persistent UE hotspot for MLB, only with positionAllocator=0.
+//
+// positionAllocator=0 drops every UE on one disc of radius isd around the
+// network centre, which gives a mild, fixed asymmetry (the centre cell holds
+// ~9.6 of 35 UEs, each ring cell ~4.2) and no cell that is clearly overloaded
+// next to one with room. These knobs move round(hotspotFraction * N) of the N
+// UEs onto a disc of radius hotspotRadius around cell hotspotCellId; the rest
+// are placed exactly as before. The total UE count is unchanged, so total
+// offered load stays comparable, and the hotspot UEs are taken per traffic class
+// (u % 4) in proportion to that class's size, so the hotspot carries the same
+// traffic mix as the network.
+//
+// Positions come from the same UniformDiscPositionAllocator (ns-3 RNG, RngRun
+// stream) and mobility is the same RandomWalk2d, so a given RngRun always
+// gives the same layout. Unlike positionAllocator=1 there is no wall-clock
+// shuffle.
+//
+// hotspotFraction = 0, the default, reproduces the previous placement exactly.
+static ns3::GlobalValue g_hotspotFraction (
+    "hotspotFraction",
+    "Fraction of UEs placed in a hotspot around hotspotCellId [0, 1]."
+    " 0 = off (previous placement). Only with positionAllocator=0.",
+    ns3::DoubleValue (0.0), ns3::MakeDoubleChecker<double> (0.0, 1.0));
+static ns3::GlobalValue g_hotspotCellId (
+    "hotspotCellId", "mmWave cell id the hotspot is centred on (2 = centre cell, 3-8 = ring).",
+    ns3::UintegerValue (2), ns3::MakeUintegerChecker<uint16_t> ());
+static ns3::GlobalValue g_hotspotRadius (
+    "hotspotRadius", "Radius (m) of the hotspot disc around hotspotCellId.",
+    ns3::DoubleValue (500.0), ns3::MakeDoubleChecker<double> (1.0));
+
+// Share of the full-buffer UEs (trafficModel=3, u % 4 == 0) placed in the
+// hotspot, overriding the proportional quota for that class only.
+//
+// DL PRB follows the full-buffer UEs, not the UE count: one 1400 us full-buffer
+// UE (7.5 Mbps) can hold a 20 MHz cell near 0.7 PRB on its own, so a hotspot
+// with a proportional 4 of 9 full-buffer UEs was not reliably the PRB hotspot.
+// With a share s, round(s * nFullBuffer) of them go to the hotspot (0.78 -> 7
+// of 9 at 35 UEs). The other classes keep their hotspot quota and the total UE
+// count is unchanged, so the hotspot grows by the extra full-buffer UEs.
+//
+// -1, the default, keeps the proportional quota (the hotspotFraction-only
+// behaviour). Requires hotspotFraction > 0.
+// Keep hotspot UEs inside the r = isd disc the other UEs are placed on.
+//
+// A ring-cell hotspot disc of radius 500 m lies 55% outside that disc, on the
+// side with no neighbour cell, where no CIO can offload anyone (audit_oct_2.md
+// L9). When true, each hotspot UE's position is redrawn from the same hotspot
+// allocator (same RNG stream) until it is within isd of the network centre.
+// No effect for hotspotCellId = 2, whose disc is already inside. Requires
+// hotspotFraction > 0. false, the default, reproduces the previous placement.
+static ns3::GlobalValue g_hotspotClipToUeDisc (
+    "hotspotClipToUeDisc",
+    "Redraw hotspot UE positions until they lie within isd of the network centre.",
+    ns3::BooleanValue (false), ns3::MakeBooleanChecker ());
+
+static ns3::GlobalValue g_hotspotFbShare (
+    "hotspotFbShare",
+    "Share [0, 1] of the full-buffer UEs (u%4==0) placed in the hotspot."
+    " -1 = proportional to hotspotFraction (default).",
+    ns3::DoubleValue (-1.0), ns3::MakeDoubleChecker<double> (-1.0, 1.0));
 
 static ns3::GlobalValue g_trafficModel (
     "trafficModel",
@@ -716,8 +929,65 @@ main (int argc, char *argv[])
   GlobalValue::GetValueByName ("burstyDlRate3", stringValueTmp);
   std::string burstyDlRate3 = stringValueTmp.Get ();
   DoubleValue doubleValueTmp;
+  GlobalValue::GetValueByName ("burstyOnMeanS", doubleValueTmp);
+  double burstyOnMeanS = doubleValueTmp.Get ();
+  GlobalValue::GetValueByName ("burstyOffMeanS", doubleValueTmp);
+  double burstyOffMeanS = doubleValueTmp.Get ();
+  GlobalValue::GetValueByName ("hotspotFraction", doubleValueTmp);
+  double hotspotFraction = doubleValueTmp.Get ();
+  GlobalValue::GetValueByName ("hotspotRadius", doubleValueTmp);
+  double hotspotRadius = doubleValueTmp.Get ();
+  GlobalValue::GetValueByName ("hotspotClipToUeDisc", booleanValue);
+  bool hotspotClipToUeDisc = booleanValue.Get ();
+  GlobalValue::GetValueByName ("hotspotFbShare", doubleValueTmp);
+  double hotspotFbShare = doubleValueTmp.Get ();
+  GlobalValue::GetValueByName ("hotspotCellId", uintegerValue);
+  uint16_t hotspotCellId = uintegerValue.Get ();
   GlobalValue::GetValueByName ("controlInterval", doubleValueTmp);
   double controlIntervalCfg = doubleValueTmp.Get ();
+  GlobalValue::GetValueByName ("handoverHysteresisDb", doubleValueTmp);
+  double handoverHysteresisDb = doubleValueTmp.Get ();
+  if (handoverHysteresisDb > 0.0)
+    {
+      Config::SetDefault ("ns3::LteEnbRrc::HandoverHysteresisDb",
+                          DoubleValue (handoverHysteresisDb));
+    }
+  GlobalValue::GetValueByName ("channelConditionUpdatePeriodMs", uintegerValue);
+  uint32_t channelConditionUpdatePeriodMs = uintegerValue.Get ();
+  if (channelConditionUpdatePeriodMs != 100)
+    {
+      NS_LOG_UNCOND ("channelConditionUpdatePeriodMs " << channelConditionUpdatePeriodMs);
+    }
+  GlobalValue::GetValueByName ("logChannelConditions", booleanValue);
+  bool logChannelConditions = booleanValue.Get ();
+  GlobalValue::GetValueByName ("handoverSinrFilterTauMs", doubleValueTmp);
+  double handoverSinrFilterTauMs = doubleValueTmp.Get ();
+  if (handoverSinrFilterTauMs > 0.0)
+    {
+      Config::SetDefault ("ns3::LteEnbRrc::HandoverSinrFilterTauMs",
+                          DoubleValue (handoverSinrFilterTauMs));
+      g_marlEmitHoDecisionSinr = true;
+      NS_LOG_UNCOND ("handoverSinrFilterTauMs " << handoverSinrFilterTauMs);
+    }
+  BooleanValue tttFromBiasedSinrValue;
+  GlobalValue::GetValueByName ("tttFromBiasedSinr", tttFromBiasedSinrValue);
+  if (tttFromBiasedSinrValue.Get ())
+    {
+      Config::SetDefault ("ns3::LteEnbRrc::TttFromBiasedSinr", BooleanValue (true));
+    }
+  if (handoverHysteresisDb > 0.0 || tttFromBiasedSinrValue.Get ())
+    {
+      NS_LOG_UNCOND ("handoverHysteresisDb " << handoverHysteresisDb << " tttFromBiasedSinr "
+                     << tttFromBiasedSinrValue.Get ());
+    }
+  GlobalValue::GetValueByName ("controlPhaseOffsetS", doubleValueTmp);
+  double controlPhaseOffsetS = doubleValueTmp.Get ();
+  if (controlPhaseOffsetS > 0.0)
+    {
+      // Before any device exists, so every MmWaveEnbNetDevice picks it up.
+      Config::SetDefault ("ns3::MmWaveEnbNetDevice::MarlBankSinrBins", BooleanValue (true));
+      g_marlUseBankedSinrBins = true;
+    }
   GlobalValue::GetValueByName ("nBsNoUesAlloc", integerValue);
   int8_t nBsNoUesAlloc = integerValue.Get ();
   GlobalValue::GetValueByName ("positionAllocator", uintegerValue);
@@ -773,6 +1043,13 @@ main (int argc, char *argv[])
   bool e2nrEnabled = booleanValue.Get ();
   GlobalValue::GetValueByName ("e2du", booleanValue);
   bool e2du = booleanValue.Get ();
+  if (controlPhaseOffsetS > 0.0 && !e2du)
+    {
+      // MarlControlStep then reads the banked SINR bins, which only the DU
+      // report (EnableDuReport) writes: sinr_bins would stay zero all run.
+      NS_FATAL_ERROR ("controlPhaseOffsetS > 0 needs e2du=true: the banked SINR bins "
+                      "are filled by the DU report only");
+    }
   GlobalValue::GetValueByName ("e2cuUp", booleanValue);
   bool e2cuUp = booleanValue.Get ();
   GlobalValue::GetValueByName ("e2cuCp", booleanValue);
@@ -844,7 +1121,7 @@ main (int argc, char *argv[])
   //Config::SetDefault ("ns3::MmWaveBearerStatsCalculator::EpochDuration", TimeValue (MilliSeconds (10.0)));
 
   Config::SetDefault ("ns3::ThreeGppChannelModel::UpdatePeriod", TimeValue (MilliSeconds (100.0)));
-  Config::SetDefault ("ns3::ThreeGppChannelConditionModel::UpdatePeriod", TimeValue (MilliSeconds (100)));
+  Config::SetDefault ("ns3::ThreeGppChannelConditionModel::UpdatePeriod", TimeValue (MilliSeconds (channelConditionUpdatePeriodMs)));
 
   Config::SetDefault ("ns3::LteRlcAm::ReportBufferStatusTimer", TimeValue (MilliSeconds (10.0)));
   Config::SetDefault ("ns3::LteRlcUmLowLat::ReportBufferStatusTimer",
@@ -1036,11 +1313,146 @@ main (int argc, char *argv[])
                                   "Bounds",
                                   RectangleValue(Rectangle(0, maxXAxis, 0, maxYAxis)));
       uemobility.SetPositionAllocator(uePositionAlloc);
-      uemobility.Install(ueNodes);
+      if (hotspotClipToUeDisc && hotspotFraction <= 0.0)
+      {
+          NS_FATAL_ERROR("hotspotClipToUeDisc needs hotspotFraction > 0");
+      }
+      if (hotspotFbShare >= 0.0 && hotspotFraction <= 0.0)
+      {
+          NS_FATAL_ERROR("hotspotFbShare needs hotspotFraction > 0");
+      }
+      if (hotspotFraction <= 0.0)
+      {
+          uemobility.Install(ueNodes);
+          break;
+      }
+
+      // Hotspot (see g_hotspotFraction). Pick how many UEs of each traffic class
+      // u % 4 go to the hotspot: floor(f * classSize), then the leftover seats of
+      // round(f * N) go to the classes with the largest fractional parts, ties to
+      // the lower class. Within a class the lowest indices are taken, so the set
+      // depends only on (f, N), never on the RNG.
+      if (hotspotCellId < 2 || hotspotCellId > 1 + nMmWaveEnbNodes)
+      {
+          NS_FATAL_ERROR("hotspotCellId " << hotspotCellId << " is not a mmWave cell [2, "
+                         << 1 + nMmWaveEnbNodes << "]");
+      }
+      Vector hotspotCenter =
+          mmWaveEnbNodes.Get(hotspotCellId - 2)->GetObject<MobilityModel>()->GetPosition();
+      if (hotspotCenter.x - hotspotRadius < 0 || hotspotCenter.x + hotspotRadius > maxXAxis ||
+          hotspotCenter.y - hotspotRadius < 0 || hotspotCenter.y + hotspotRadius > maxYAxis)
+      {
+          NS_FATAL_ERROR("hotspot disc of radius " << hotspotRadius << " around "
+                         << hotspotCenter << " leaves the mobility bounds");
+      }
+      uint32_t nHotspot = static_cast<uint32_t>(std::lround(hotspotFraction * nUeNodes));
+      uint32_t classSize[4] = {0, 0, 0, 0};
+      for (uint32_t u = 0; u < nUeNodes; ++u)
+      {
+          classSize[u % 4]++;
+      }
+      uint32_t classQuota[4];
+      double classRemainder[4];
+      uint32_t assigned = 0;
+      for (int c = 0; c < 4; ++c)
+      {
+          double exact = hotspotFraction * classSize[c];
+          classQuota[c] = static_cast<uint32_t>(std::floor(exact));
+          classRemainder[c] = exact - classQuota[c];
+          assigned += classQuota[c];
+      }
+      while (assigned < nHotspot)
+      {
+          int best = -1;
+          for (int c = 0; c < 4; ++c)
+          {
+              if (classQuota[c] < classSize[c] &&
+                  (best < 0 || classRemainder[c] > classRemainder[best]))
+              {
+                  best = c;
+              }
+          }
+          classQuota[best]++;
+          classRemainder[best] = -1.0;
+          assigned++;
+      }
+      if (hotspotFbShare >= 0.0)
+      {
+          classQuota[0] =
+              static_cast<uint32_t>(std::lround(hotspotFbShare * classSize[0]));
+      }
+
+      NodeContainer hotspotUes;
+      NodeContainer otherUes;
+      std::vector<bool> inHotspot(nUeNodes, false);
+      uint32_t taken[4] = {0, 0, 0, 0};
+      for (uint32_t u = 0; u < nUeNodes; ++u)
+      {
+          if (taken[u % 4] < classQuota[u % 4])
+          {
+              taken[u % 4]++;
+              inHotspot[u] = true;
+              hotspotUes.Add(ueNodes.Get(u));
+          }
+          else
+          {
+              otherUes.Add(ueNodes.Get(u));
+          }
+      }
+
+      // Same allocator object, re-centred, so no new RNG stream is created.
+      uePositionAlloc->SetX(hotspotCenter.x);
+      uePositionAlloc->SetY(hotspotCenter.y);
+      uePositionAlloc->SetRho(hotspotRadius);
+      if (hotspotClipToUeDisc)
+      {
+          Ptr<ListPositionAllocator> clipped = CreateObject<ListPositionAllocator>();
+          for (uint32_t i = 0; i < hotspotUes.GetN(); ++i)
+          {
+              Vector p = uePositionAlloc->GetNext();
+              while (CalculateDistance(p, centerPosition) > isd)
+              {
+                  p = uePositionAlloc->GetNext();
+              }
+              clipped->Add(p);
+          }
+          uemobility.SetPositionAllocator(clipped);
+          uemobility.Install(hotspotUes);
+          uemobility.SetPositionAllocator(uePositionAlloc);
+      }
+      else
+      {
+          uemobility.Install(hotspotUes);
+      }
+      uePositionAlloc->SetX(centerPosition.x);
+      uePositionAlloc->SetY(centerPosition.y);
+      uePositionAlloc->SetRho(isd);
+      uemobility.Install(otherUes);
+
+      NS_LOG_UNCOND("Hotspot: " << hotspotUes.GetN() << " of " << unsigned(nUeNodes)
+                    << " UEs on a " << hotspotRadius << " m disc around cell "
+                    << hotspotCellId << " at " << hotspotCenter << ", per class u%4 = "
+                    << classQuota[0] << "/" << classQuota[1] << "/" << classQuota[2] << "/"
+                    << classQuota[3] << " of " << classSize[0] << "/" << classSize[1] << "/"
+                    << classSize[2] << "/" << classSize[3]);
+
+      // Layout record for checking: index, class, hotspot flag, start position.
+      std::ofstream layout("hotspot_layout.txt", std::ios_base::out | std::ios_base::trunc);
+      layout << "u class in_hotspot x y z" << std::endl;
+      for (uint32_t u = 0; u < nUeNodes; ++u)
+      {
+          Vector p = ueNodes.Get(u)->GetObject<MobilityModel>()->GetPosition();
+          layout << u << " " << u % 4 << " " << inHotspot[u] << " " << p.x << " " << p.y
+                 << " " << p.z << std::endl;
+      }
       break;
   }
 
   case 1: {
+      if (hotspotFraction > 0.0)
+      {
+          NS_FATAL_ERROR("hotspotFraction is only implemented for positionAllocator=0");
+      }
       if (nBsNoUesAlloc == -1)
       {
           NS_FATAL_ERROR("nBsNoUesAlloc not correct for selected positionAllocator " << nBsNoUesAlloc << positionAllocator);
@@ -1123,6 +1535,16 @@ main (int argc, char *argv[])
   // Add X2 interfaces
   mmwaveHelper->AddX2Interface (lteEnbNodes, mmWaveEnbNodes);
 
+  // The hotspot was centred on mmWaveEnbNodes.Get(hotspotCellId - 2), which
+  // assumes cell ids are handed out in install order (LTE first). Check it.
+  if (hotspotFraction > 0.0 &&
+      DynamicCast<MmWaveEnbNetDevice> (mmWaveEnbDevs.Get (hotspotCellId - 2))->GetCellId () !=
+          hotspotCellId)
+    {
+      NS_FATAL_ERROR ("hotspot centred on the wrong cell: node index "
+                      << hotspotCellId - 2 << " is not cell " << hotspotCellId);
+    }
+
   // Manual attachment
   mmwaveHelper->AttachToClosestEnb (mcUeDevs, mmWaveEnbDevs, lteEnbDevs);
 
@@ -1151,6 +1573,9 @@ main (int argc, char *argv[])
   clientHelperTcp.SetAttribute ("DataRate", StringValue (dataRate));
   clientHelperTcp.SetAttribute ("PacketSize", UintegerValue (1280));
 
+  // clientHelperTcp150/750 are no longer installed, but keep them: their
+  // ExponentialRandomVariables consume RNG streams, and removing them changes
+  // every later stream (same-seed runs stop being byte-identical).
   OnOffHelper clientHelperTcp150 ("ns3::TcpSocketFactory", Address ());
   clientHelperTcp150.SetAttribute ("Remote", serverAddressTcp);
   clientHelperTcp150.SetAttribute ("OnTime", StringValue ("ns3::ExponentialRandomVariable"));
@@ -1183,21 +1608,29 @@ main (int argc, char *argv[])
       "ns3::UdpSocketFactory",
       Address (InetSocketAddress (Ipv4Address::GetAny (), portUdpDl)));
 
+  // Mean ON/OFF durations from burstyOnMeanS/burstyOffMeanS (default 1.0 s).
+  std::ostringstream burstyOnTimeStr, burstyOffTimeStr;
+  burstyOnTimeStr << "ns3::ExponentialRandomVariable[Mean=" << burstyOnMeanS << "]";
+  burstyOffTimeStr << "ns3::ExponentialRandomVariable[Mean=" << burstyOffMeanS << "]";
+  std::string burstyOnTimeRv = burstyOnTimeStr.str ();
+  std::string burstyOffTimeRv = burstyOffTimeStr.str ();
+  NS_LOG_UNCOND ("Bursty DL OnTime " << burstyOnTimeRv << " OffTime " << burstyOffTimeRv);
+
   OnOffHelper clientHelperUdpDl1 ("ns3::UdpSocketFactory", Address ());
-  clientHelperUdpDl1.SetAttribute ("OnTime", StringValue ("ns3::ExponentialRandomVariable"));
-  clientHelperUdpDl1.SetAttribute ("OffTime", StringValue ("ns3::ExponentialRandomVariable"));
+  clientHelperUdpDl1.SetAttribute ("OnTime", StringValue (burstyOnTimeRv));
+  clientHelperUdpDl1.SetAttribute ("OffTime", StringValue (burstyOffTimeRv));
   clientHelperUdpDl1.SetAttribute ("DataRate", StringValue (burstyDlRate1));
   clientHelperUdpDl1.SetAttribute ("PacketSize", UintegerValue (1280));
 
   OnOffHelper clientHelperUdpDl2 ("ns3::UdpSocketFactory", Address ());
-  clientHelperUdpDl2.SetAttribute ("OnTime", StringValue ("ns3::ExponentialRandomVariable"));
-  clientHelperUdpDl2.SetAttribute ("OffTime", StringValue ("ns3::ExponentialRandomVariable"));
+  clientHelperUdpDl2.SetAttribute ("OnTime", StringValue (burstyOnTimeRv));
+  clientHelperUdpDl2.SetAttribute ("OffTime", StringValue (burstyOffTimeRv));
   clientHelperUdpDl2.SetAttribute ("DataRate", StringValue (burstyDlRate2));
   clientHelperUdpDl2.SetAttribute ("PacketSize", UintegerValue (1280));
 
   OnOffHelper clientHelperUdpDl3 ("ns3::UdpSocketFactory", Address ());
-  clientHelperUdpDl3.SetAttribute ("OnTime", StringValue ("ns3::ExponentialRandomVariable"));
-  clientHelperUdpDl3.SetAttribute ("OffTime", StringValue ("ns3::ExponentialRandomVariable"));
+  clientHelperUdpDl3.SetAttribute ("OnTime", StringValue (burstyOnTimeRv));
+  clientHelperUdpDl3.SetAttribute ("OffTime", StringValue (burstyOffTimeRv));
   clientHelperUdpDl3.SetAttribute ("DataRate", StringValue (burstyDlRate3));
   clientHelperUdpDl3.SetAttribute ("PacketSize", UintegerValue (1280));
 
@@ -1430,6 +1863,22 @@ main (int argc, char *argv[])
   // Since nodes are randomly allocated during each run we always need to print their positions
   PrintGnuplottableUeListToFile ("ues.txt");
   PrintGnuplottableEnbListToFile ("enbs.txt");
+  if (logChannelConditions)
+    {
+      PointerValue condPtr;
+      DynamicCast<ThreeGppPropagationLossModel> (mmwaveHelper->GetPathLossModel (0))
+          ->GetAttribute ("ChannelConditionModel", condPtr);
+      Ptr<ChannelConditionModel> condModel = condPtr.Get<ChannelConditionModel> ();
+      NS_ABORT_MSG_IF (!condModel, "logChannelConditions: no channel condition model");
+      Simulator::Schedule (MilliSeconds (50), &LogChannelConditions, condModel, ueNodes,
+                           mmWaveEnbNodes, controlIntervalCfg, std::string ("channel_conditions.txt"));
+    }
+  if (hotspotFraction > 0.0)
+    {
+      // End-of-run positions, to check the hotspot is still there after the walk.
+      Simulator::Schedule (Seconds (simTime) - MilliSeconds (1),
+                           &PrintGnuplottableUeListToFile, std::string ("ues_end.txt"));
+    }
   Ptr<LteEnbNetDevice> ltedev = DynamicCast<LteEnbNetDevice> (lteEnbDevs.Get (0));
   Ptr<LteEnbRrc> lte_rrc = ltedev->GetRrc ();  
   for (double i = 0.0; i < simTime; i = i + indicationPeriodicity){
@@ -1461,7 +1910,7 @@ main (int argc, char *argv[])
   // Schedule the first MARL step at t = 0.0 using the primary LTE eNodeB device
   // (control target) and the full mmWave eNB container (real per-cell KPI source)
   Ptr<LteEnbNetDevice> primaryLteEnb = lteEnbDevs.Get(0)->GetObject<LteEnbNetDevice>();
-  Simulator::Schedule (Seconds (0.0),
+  Simulator::Schedule (Seconds (controlPhaseOffsetS),
                        &MarlControlStep,
                        zmqClient,
                        primaryLteEnb,

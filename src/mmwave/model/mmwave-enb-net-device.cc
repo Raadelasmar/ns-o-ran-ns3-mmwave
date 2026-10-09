@@ -206,6 +206,12 @@ MmWaveEnbNetDevice::DrainMarlDlRxBytes(double& windowSeconds)
     return drained;
 }
 
+std::vector<uint32_t>
+MmWaveEnbNetDevice::GetMarlBankedSinrBins() const
+{
+    return m_marlBankedSinrBins;
+}
+
 uint32_t
 MmWaveEnbNetDevice::GetRlcBufferOccupancyCellSpecific()
 {
@@ -282,6 +288,13 @@ TypeId MmWaveEnbNetDevice::GetTypeId ()
                           PointerValue(),
                           MakePointerAccessor(&MmWaveEnbNetDevice::m_e2DuCalculator),
                           MakePointerChecker<MmWavePhyTrace>())
+            .AddAttribute("MarlBankSinrBins",
+                          "If true, bank this cell's DL SINR bin counts at every DU report "
+                          "build, before the live counters are reset, for the MARL control "
+                          "step (GetMarlBankedSinrBins). Off by default: nothing is copied.",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&MmWaveEnbNetDevice::m_marlBankSinrBins),
+                          MakeBooleanChecker())
             .AddAttribute("EnableCuUpReport",
                           "If true, send CuUpReport",
                           BooleanValue(false),
@@ -1415,6 +1428,15 @@ MmWaveEnbNetDevice::BuildRicIndicationMessageDu(std::string plmId, uint16_t nrCe
 
     m_dlPrbUsage = dlPrbUsage;
     m_rlcBufferOccupCellSpecific = rlcBufferOccupCellSpecific;
+    if (m_marlBankSinrBins)
+    {
+        // Complete window: each UE's bins were added above before its
+        // ResetPhyTracesForRntiCellId call.
+        m_marlBankedSinrBins = {macSinrBin1CellSpecific, macSinrBin2CellSpecific,
+                                macSinrBin3CellSpecific, macSinrBin4CellSpecific,
+                                macSinrBin5CellSpecific, macSinrBin6CellSpecific,
+                                macSinrBin7CellSpecific};
+    }
 
     if (!indicationMessageHelper->IsOffline())
     {
