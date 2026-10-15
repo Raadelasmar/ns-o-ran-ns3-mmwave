@@ -37,12 +37,35 @@
 #include "ns3/simulator.h"
 #include "ns3/string.h"
 
+#include <vector>
+
 namespace ns3
 {
 
 NS_LOG_COMPONENT_DEFINE("LteRlcAm");
 
 NS_OBJECT_ENSURE_REGISTERED(LteRlcAm);
+
+namespace
+{
+// Packet::Copy() only increments the underlying Buffer's refcount
+// (copy-on-write): the new Packet keeps sharing the same memory until a
+// write forces a fork, and Buffer::AddAtEnd's own fork-before-write check
+// (CreateFullCopy()) is a no-op whenever the buffer has no "zero area" --
+// the normal case for a real received packet. So two segments stored via
+// Copy() can still alias and trip NS_ASSERT(m_data != start.m_data) in
+// Buffer::Iterator::Write when DoReceivePdu's reassembly loop appends one
+// onto another. Round-tripping through raw bytes forces a true, physically
+// independent allocation up front.
+Ptr<Packet>
+DeepCopyPacket(Ptr<const Packet> p)
+{
+    uint32_t size = p->GetSize();
+    std::vector<uint8_t> raw(size);
+    p->CopyData(raw.data(), size);
+    return Create<Packet>(raw.data(), size);
+}
+} // namespace
 
 LteRlcAm::LteRlcAm()
 {
@@ -2039,7 +2062,10 @@ LteRlcAm::DoReceivePdu(LteMacSapUser::ReceivePduParameters rxPduParams)
                         rlcAmHeader.GetSegmentOffset() + 32768 == lastSegHdr.GetLastOffset())
                     {
                         // segment is next in sequence
-                        it->second.m_byteSegments.push_back(rxPduParams.p);
+                        // DeepCopyPacket() (not Copy(), and not the bare Ptr<Packet>) so
+                        // m_byteSegments entries can never alias the same underlying Buffer --
+                        // see DeepCopyPacket's comment for why Copy() alone is not enough.
+                        it->second.m_byteSegments.push_back(DeepCopyPacket(rxPduParams.p));
                         if (rlcAmHeader.GetLastSegmentFlag() == LteRlcAmHeader::LAST_PDU_SEGMENT)
                         {
                             // got last segment, reassemble segments
@@ -2077,7 +2103,11 @@ LteRlcAm::DoReceivePdu(LteMacSapUser::ReceivePduParameters rxPduParams)
                 if (rlcAmHeader.GetSegmentOffset() == 0)
                 {
                     NS_LOG_LOGIC("Place PDU in the reception buffer ( SN = " << seqNumber << " )");
-                    m_rxonBuffer[seqNumber.GetValue()].m_byteSegments.push_back(rxPduParams.p);
+                    // DeepCopyPacket(): same reasoning as the other m_byteSegments.push_back
+                    // above -- this is the first segment stored for this SN, and it must not
+                    // alias whatever a later-arriving segment for the same SN gets stored as.
+                    m_rxonBuffer[seqNumber.GetValue()].m_byteSegments.push_back(
+                        DeepCopyPacket(rxPduParams.p));
                     if (rlcAmHeader.GetResegmentationFlag() == LteRlcAmHeader::SEGMENT)
                     {
                         NS_LOG_INFO("RLC AM PDU segment received, offset= "
