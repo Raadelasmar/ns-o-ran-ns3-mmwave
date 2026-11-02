@@ -435,7 +435,7 @@ LteEnbNetDevice::ApplyControlPayload(const nlohmann::json& actionPayload)
 
     // Each cell's entry may carry MLB's action, MRO's action, both or
     // neither -- the two agents act on independent parameters (CIO biases the
-    // handover ranking, ho_margin_db biases whether a handover triggers at
+    // handover ranking, ho_margin_pairs biases whether a handover triggers at
     // all), so they are checked independently rather than one gating the
     // other the way a single "continue if this key is missing" used to.
     for (auto& [cellIdStr, cellAction] : actionPayload["cells"].items())
@@ -456,13 +456,20 @@ LteEnbNetDevice::ApplyControlPayload(const nlohmann::json& actionPayload)
             m_rrc->SetCellIndividualOffset(cellId, cioDb);
         }
 
-        // 2. MRO Agent action (handover-margin OFFSET, added to the base
-        // HoSinrDifference rather than replacing it -- see
-        // LteEnbRrc::GetEffectiveSinrThreshold).
-        if (cellAction.contains("ho_margin_db"))
+        // 2. MRO Agent action (v3: per-(serving, target)-PAIR handover-margin
+        // OFFSET, added to the base HoSinrDifference rather than replacing it
+        // -- see LteEnbRrc::GetEffectiveSinrThreshold). cellId here is the
+        // SERVING cell; "ho_margin_pairs" maps each candidate/target cell ID
+        // (as a string key, matching "cells"'s own convention) to its offset
+        // in dB for a UE served by cellId.
+        if (cellAction.contains("ho_margin_pairs") && cellAction["ho_margin_pairs"].is_object())
         {
-            double marginDb = cellAction["ho_margin_db"].get<double>();
-            m_rrc->SetHandoverMarginOffset(cellId, marginDb);
+            for (auto& [targetCellIdStr, marginDbJson] : cellAction["ho_margin_pairs"].items())
+            {
+                uint16_t targetCellId = std::stoi(targetCellIdStr);
+                double marginDb = marginDbJson.get<double>();
+                m_rrc->SetHandoverMarginOffset(cellId, targetCellId, marginDb);
+            }
         }
     }
 
