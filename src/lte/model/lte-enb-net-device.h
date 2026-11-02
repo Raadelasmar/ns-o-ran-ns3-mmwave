@@ -74,10 +74,13 @@ class LteEnbNetDevice : public LteNetDevice
     /**
      * \brief Apply control actions (CIO, handover margin, Tx Power, etc.) received from the MARL ZeroMQ bridge
      * \param actionPayload JSON payload of the form
-     *        { "cells": { "<cellId>": { "cio_offset": <dB>, "ho_margin_db": <dB>, ... }, ... } },
-     *        mirroring the per-cell "cells" shape used for the KPI payload sent to Python.
-     *        Both keys are optional per cell and independent of each other (MLB's CIO and
-     *        MRO's handover margin act on different parameters).
+     *        { "cells": { "<cellId>": { "cio_offset": <dB>,
+     *                                    "ho_margin_pairs": { "<targetCellId>": <dB>, ... }, ... }, ... } },
+     *        mirroring the per-cell "cells" shape used for the KPI payload sent to Python. cellId
+     *        is the serving cell; ho_margin_pairs maps each candidate/target cell to its own
+     *        offset, so the correction is directional. Both keys are optional per cell and
+     *        independent of each other (MLB's CIO and MRO's handover margin act on different
+     *        parameters).
      */
     void ApplyControlPayload (const nlohmann::json& actionPayload);
 
